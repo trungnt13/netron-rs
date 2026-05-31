@@ -29,6 +29,8 @@ and future web/VS Code clients.
   - `search(query, limits) -> SearchEntry[]`
   - `tensor_metadata(limits) -> TensorMetadata[]`
   - `detail(handle, limits) -> EntityDetail?`
+  - `slice(handle, limits) -> SliceResponse?`
+  - `layout(handle, limits) -> LayoutResponse?`
 
 ## Format and Handle Types
 
@@ -103,6 +105,14 @@ and future web/VS Code clients.
 - `EntityDetail`
   - `handle`, `title`, bounded string `fields`, and bounded related handles;
     ONNX and MLIR details share this envelope
+- `SliceResponse`
+  - `api_version`, `session_id`, `format`, `scope`, `cache_key`
+  - `limit_used`, `truncated`, `omitted_count`, `warnings`
+  - bounded `entities`, `edges`, and `boundaries`
+- `LayoutResponse`
+  - `api_version`, `session_id`, `format`, `scope`, `cache_key`
+  - `limit_used`, `truncated`, `omitted_count`, `warnings`
+  - bounded `graph` layout payload with layout stats
 
 ## Error Mapping
 

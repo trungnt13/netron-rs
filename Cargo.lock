@@ -140,7 +140,9 @@ version = "0.1.0"
 dependencies = [
  "netron-rs-core",
  "netron-rs-formats",
+ "netron-rs-layout",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

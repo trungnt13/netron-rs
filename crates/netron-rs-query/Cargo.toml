@@ -10,4 +10,8 @@ rust-version.workspace = true
 [dependencies]
 netron-rs-core = { version = "0.1.0", path = "../netron-rs-core" }
 netron-rs-formats = { version = "0.1.0", path = "../netron-rs-formats" }
+netron-rs-layout = { version = "0.1.0", path = "../netron-rs-layout" }
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
