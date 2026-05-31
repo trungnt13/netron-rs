@@ -10,6 +10,8 @@ use netron_rs_formats::ToNormalizedJson;
 use netron_rs_query::{EntityHandle, FormatKind, ModelSession, ModelSource, SessionLimits};
 use serde::Serialize;
 
+mod service;
+
 const CLI_SCHEMA_VERSION: u32 = 1;
 
 fn main() {
@@ -154,6 +156,7 @@ fn run_command(command: Command) -> Result<(), CliFailure> {
                 .ok_or_else(|| CliFailure::invalid("tensor id is not available"))?;
             print_output("onnx.tensor", json, &metadata)?;
         }
+        Command::ServeStdio => service::serve_stdio()?,
     }
     Ok(())
 }
@@ -369,6 +372,7 @@ enum Command {
         tensor: usize,
         json: bool,
     },
+    ServeStdio,
 }
 
 enum LayoutSelector {
@@ -395,7 +399,7 @@ enum LayoutRequest {
 
 impl Command {
     fn parse(args: Vec<String>) -> Result<Self, CliFailure> {
-        if args.len() == 1 {
+        if args.len() == 1 && args[0] != "serve" {
             return Ok(Self::Parse {
                 path: PathBuf::from(&args[0]),
             });
@@ -413,6 +417,7 @@ impl Command {
             "detail" => parse_detail(args).map_err(|error| error.or_command("detail")),
             "mlir" => parse_mlir(args).map_err(|error| error.or_command("mlir")),
             "onnx" => parse_onnx(args).map_err(|error| error.or_command("onnx")),
+            "serve" => parse_serve(args).map_err(|error| error.or_command("serve")),
             _ => Err(Self::usage()),
         }
     }
@@ -428,12 +433,13 @@ impl Command {
             Self::Detail { .. } => "detail",
             Self::MlirSymbols { .. } => "mlir.symbols",
             Self::OnnxTensor { .. } => "onnx.tensor",
+            Self::ServeStdio => "serve",
         }
     }
 
     fn usage() -> CliFailure {
         CliFailure::invalid(
-            "usage: netron-rs [parse|summary|stats|bench|layout|search|detail|mlir|onnx] ...",
+            "usage: netron-rs [parse|summary|stats|bench|layout|search|detail|mlir|onnx|serve] ...",
         )
     }
 }
@@ -691,6 +697,15 @@ fn parse_onnx(mut args: Vec<String>) -> Result<Command, CliFailure> {
         tensor,
         json,
     })
+}
+
+fn parse_serve(mut args: Vec<String>) -> Result<Command, CliFailure> {
+    args.remove(0);
+    match args.as_slice() {
+        [] => Ok(Command::ServeStdio),
+        [flag] if flag == "--stdio" => Ok(Command::ServeStdio),
+        _ => Err(CliFailure::invalid("serve supports only --stdio").with_command("serve")),
+    }
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {

@@ -1,5 +1,6 @@
 use std::fs;
-use std::process::{Command, Output};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 #[test]
 fn stats_reports_model_size_without_tensor_materialization() {
@@ -411,6 +412,120 @@ fn json_errors_use_stable_exit_codes() {
 }
 
 #[test]
+fn service_stdio_matches_cli_for_shared_operations() {
+    let onnx = write_fixture("service-summary.onnx");
+    let cli_summary = success_json(
+        Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+            .arg("summary")
+            .arg(&onnx)
+            .arg("--json")
+            .output()
+            .expect("run cli summary"),
+    );
+
+    let mlir = write_mlir_fixture(
+        "service-search",
+        "module {\n  func.func @main() {\n    return\n  }\n}\n",
+    );
+    let cli_search = success_json(
+        Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+            .arg("search")
+            .arg(&mlir)
+            .arg("main")
+            .arg("--limit")
+            .arg("1")
+            .arg("--json")
+            .output()
+            .expect("run cli search"),
+    );
+
+    let mut service = ServiceProcess::spawn();
+    let open = service.request(serde_json::json!({
+        "id": 1,
+        "method": "open",
+        "params": { "path": onnx }
+    }));
+    assert_eq!(open["status"], "ok");
+    let onnx_session = open["data"]["session"].as_u64().unwrap();
+    let summary = service.request(serde_json::json!({
+        "id": 2,
+        "method": "summary",
+        "params": { "session": onnx_session }
+    }));
+    assert_eq!(summary["command"], "summary");
+    assert_eq!(summary["data"]["format"], cli_summary["data"]["format"]);
+    assert_eq!(summary["data"]["graphs"], cli_summary["data"]["graphs"]);
+    assert_eq!(summary["data"]["nodes"], cli_summary["data"]["nodes"]);
+    let diagnostics = service.request(serde_json::json!({
+        "id": 21,
+        "method": "diagnostics",
+        "params": { "session": onnx_session, "limit": 4 }
+    }));
+    assert_eq!(diagnostics["command"], "diagnostics");
+    assert!(diagnostics["data"]["diagnostics"].is_array());
+    let detail = service.request(serde_json::json!({
+        "id": 22,
+        "method": "detail",
+        "params": {
+            "session": onnx_session,
+            "handle": { "kind": "node", "graph": 0, "node": 0 }
+        }
+    }));
+    assert_eq!(detail["data"]["fields"]["operator"], "Add");
+    let slice = service.request(serde_json::json!({
+        "id": 23,
+        "method": "slice",
+        "params": {
+            "session": onnx_session,
+            "max_nodes": 2,
+            "handle": { "kind": "node", "graph": 0, "node": 0 }
+        }
+    }));
+    assert_eq!(slice["data"]["scope"]["kind"], "node");
+    assert_eq!(slice["data"]["limit_used"], 2);
+    let layout = service.request(serde_json::json!({
+        "id": 24,
+        "method": "layout",
+        "params": {
+            "session": onnx_session,
+            "max_nodes": 1,
+            "handle": { "kind": "graph", "graph": 0 }
+        }
+    }));
+    assert_eq!(layout["data"]["scope"]["kind"], "graph");
+    assert_eq!(layout["data"]["limit_used"], 1);
+    let export = service.request(serde_json::json!({
+        "id": 25,
+        "method": "export",
+        "params": { "session": onnx_session, "limit": 5 }
+    }));
+    assert_eq!(export["command"], "export");
+    assert_eq!(export["data"]["limit_used"], 5);
+    assert!(export["data"]["omitted_count"].is_number());
+    assert!(export["data"]["normalized"].is_object());
+
+    let open = service.request(serde_json::json!({
+        "id": 3,
+        "method": "open",
+        "params": { "path": mlir }
+    }));
+    let mlir_session = open["data"]["session"].as_u64().unwrap();
+    let search = service.request(serde_json::json!({
+        "id": 4,
+        "method": "search",
+        "params": { "session": mlir_session, "query": "main", "limit": 1 }
+    }));
+    assert_eq!(search["command"], "search");
+    assert_eq!(search["data"], cli_search["data"]);
+    let close = service.request(serde_json::json!({
+        "id": 5,
+        "method": "close",
+        "params": { "session": mlir_session }
+    }));
+    assert_eq!(close["data"]["closed"], true);
+}
+
+#[test]
 fn parse_rejects_directory_input() {
     let root = temp_root("netron-rs-directory");
     fs::create_dir_all(&root).unwrap();
@@ -428,6 +543,47 @@ fn parse_rejects_directory_input() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+struct ServiceProcess {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+impl ServiceProcess {
+    fn spawn() -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+            .arg("serve")
+            .arg("--stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn service");
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            input,
+            output,
+        }
+    }
+
+    fn request(&mut self, request: serde_json::Value) -> serde_json::Value {
+        writeln!(self.input, "{request}").unwrap();
+        self.input.flush().unwrap();
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+impl Drop for ServiceProcess {
+    fn drop(&mut self) {
+        let _ = self.input.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn success_json(output: Output) -> serde_json::Value {
