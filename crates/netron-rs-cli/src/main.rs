@@ -7,6 +7,7 @@ use std::time::Instant;
 use memmap2::Mmap;
 use netron_rs_core::{Model, ModelInput, TensorStorage};
 use netron_rs_formats::ToNormalizedJson;
+use netron_rs_query::{ModelSession, ModelSource, SessionLimits};
 use serde::Serialize;
 
 fn main() {
@@ -23,6 +24,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mapped = MappedModel::open(&path)?;
             let model = netron_rs_formats::parse(mapped.input())?;
             println!("{}", model.to_normalized_json()?);
+        }
+        Command::Summary { path } => {
+            let mapped = MappedModel::open(&path)?;
+            let session = ModelSession::open(mapped.bytes(), mapped.source())?;
+            let summary = session.summary(&SessionLimits::default());
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::Stats { path } => {
             let mapped = MappedModel::open(&path)?;
@@ -73,6 +80,9 @@ enum Command {
     Parse {
         path: PathBuf,
     },
+    Summary {
+        path: PathBuf,
+    },
     Stats {
         path: PathBuf,
     },
@@ -99,6 +109,9 @@ impl Command {
                 path: PathBuf::from(path),
             }),
             [command, path] if command == "parse" => Ok(Self::Parse {
+                path: PathBuf::from(path),
+            }),
+            [command, path] if command == "summary" => Ok(Self::Summary {
                 path: PathBuf::from(path),
             }),
             [command, path] if command == "stats" => Ok(Self::Stats {
@@ -138,7 +151,7 @@ impl Command {
                 limit: limit.parse::<usize>()?.max(1),
             }),
             _ => Err(
-                "usage: netron-rs [parse|stats|bench|layout|search] <model> [query|iterations|graph] [limit|max_nodes]"
+                "usage: netron-rs [parse|summary|stats|bench|layout|search] <model> [query|iterations|graph] [limit|max_nodes]"
                     .into(),
             ),
         }
@@ -187,6 +200,14 @@ impl MappedModel {
             path: Some(self.path.as_path()),
             allow_unsafe_paths: false,
         }
+    }
+
+    fn source(&self) -> ModelSource {
+        ModelSource::from_file(self.path.clone(), self.len()).with_allow_unsafe_paths(false)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.data.as_ref()
     }
 
     fn len(&self) -> usize {

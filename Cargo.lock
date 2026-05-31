@@ -139,6 +139,7 @@ name = "netron-rs-query"
 version = "0.1.0"
 dependencies = [
  "netron-rs-core",
+ "netron-rs-formats",
  "serde",
 ]
 

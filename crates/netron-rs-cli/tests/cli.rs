@@ -76,6 +76,67 @@ fn search_reports_bounded_query_hits() {
 }
 
 #[test]
+fn summary_reports_indexed_session_info() {
+    let model = write_fixture("summary.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&model)
+        .output()
+        .expect("run summary");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["format"], "onnx");
+    assert_eq!(summary["graphs"], 1);
+    assert_eq!(summary["nodes"], 1);
+    assert_eq!(summary["tensors"], 1);
+    assert_eq!(summary["source"]["kind"]["kind"], "file");
+    assert!(
+        summary["source"]["content_identity"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv1a64:")
+    );
+}
+
+#[test]
+fn summary_supports_mlir_input() {
+    let path = std::env::temp_dir()
+        .join(format!(
+            "netron-rs-summary-mlir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+        .with_extension("mlir");
+    fs::write(
+        &path,
+        "module {\n  func.func @main() {\n    %c0 = arith.constant 0 : i32\n    return\n  }\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&path)
+        .output()
+        .expect("run summary");
+    fs::remove_file(&path).unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["format"], "mlir");
+    assert_eq!(summary["functions"], 1);
+}
+
+#[test]
 fn layout_reports_format_independent_view_graph() {
     let model = write_fixture("layout.onnx");
     let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
