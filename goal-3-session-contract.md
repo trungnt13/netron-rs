@@ -45,6 +45,12 @@ and future web/VS Code clients.
   - `{ "kind": "metadata", "owner": "model", "key": "license" }`
   - `{ "kind": "operator_set", "domain": "ai.onnx", "version": 18 }`
   - `{ "kind": "diagnostic", "diagnostic": 0 }`
+  - `{ "kind": "mlir_module", "module": 0 }`
+  - `{ "kind": "mlir_function", "function": 1 }`
+  - `{ "kind": "mlir_operation", "scope": "function:0", "operation": 3 }`
+  - `{ "kind": "mlir_value", "scope": "function:0", "value": 7 }`
+  - `{ "kind": "mlir_region", "scope": "function:0", "region": 0 }`
+  - `{ "kind": "mlir_block", "scope": "function:0", "block": 0 }`
 
 ## Shared Limits
 
@@ -76,6 +82,9 @@ and future web/VS Code clients.
     per-kind counts, opsets, metadata keys, graph summaries, and bounded
     histograms for operator type, domain, dtype, storage kind, shape rank,
     fan-in, and fan-out
+  - `mlir`: optional MLIR-specific summary block with module/function/operation,
+    region/block/value, symbol/dialect/attribute/resource counts and bounded
+    region/block/scope summaries
 - `DiagnosticsResponse`
   - `api_version`
   - `session_id`
