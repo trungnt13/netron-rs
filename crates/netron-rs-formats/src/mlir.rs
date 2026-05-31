@@ -109,9 +109,12 @@ fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
     model.metadata.properties = parsed.metadata;
 
     for module in parsed.modules {
-        let name = model.intern(&module.name);
-        let graph_id = model.add_graph_placeholder(None, Some(name));
-        let mut graph = Graph::new(graph_id, None, Some(name));
+        if module.name.is_empty() && module.metadata.is_empty() && module.nodes.is_empty() {
+            continue;
+        }
+        let name = (!module.name.is_empty()).then(|| model.intern(&module.name));
+        let graph_id = model.add_graph_placeholder(None, name);
+        let mut graph = Graph::new(graph_id, None, name);
         graph.metadata = module.metadata;
         let mut values = HashMap::<String, ValueId>::new();
         for node in module.nodes {
@@ -420,7 +423,6 @@ struct CapturedLine {
 fn parse_text(text: &str) -> ParsedModel {
     let mut parsed = ParsedModel::default();
     let mut depth = 0isize;
-    let mut module_counter = 0usize;
     let mut modules = Vec::<ModuleScope>::new();
     let mut alias: Option<(String, String)> = None;
     let mut header: Option<(usize, String, Option<String>)> = None;
@@ -511,7 +513,7 @@ fn parse_text(text: &str) -> ParsedModel {
             }
         }
 
-        if let Some(module) = parse_module(trimmed, &mut module_counter) {
+        if let Some(module) = parse_module(trimmed) {
             parsed.modules.push(module);
             let parsed_index = Some(parsed.modules.len() - 1);
             let name = parsed
@@ -755,7 +757,7 @@ fn module_prefix(modules: &[ModuleScope]) -> Option<String> {
     }
 }
 
-fn parse_module(line: &str, module_counter: &mut usize) -> Option<ParsedModule> {
+fn parse_module(line: &str) -> Option<ParsedModule> {
     let rest = if let Some(rest) = line.strip_prefix("module ") {
         rest
     } else if let Some(rest) = line.strip_prefix("\"builtin.module\"") {
@@ -770,18 +772,10 @@ fn parse_module(line: &str, module_counter: &mut usize) -> Option<ParsedModule> 
         .split_whitespace()
         .find(|value| value.starts_with('@'))
         .filter(|value| value.starts_with('@'));
-    let mut name = explicit_name
+    let name = explicit_name
         .map(|name| name.to_owned())
         .or_else(|| metadata.get("sym_name").cloned())
-        .unwrap_or_else(|| {
-            let name = format!("$module{module_counter}");
-            *module_counter += 1;
-            name
-        });
-    if name.is_empty() {
-        name = format!("$module{module_counter}");
-        *module_counter += 1;
-    }
+        .unwrap_or_default();
     Some(ParsedModule {
         name,
         metadata,
@@ -831,19 +825,6 @@ fn parse_function(capture: FunctionCapture) -> ParsedFunction {
 
     for statement in top_level_statements(&capture.lines) {
         let block_arguments = parse_block_arguments(&statement.text);
-        if function.inputs.is_empty() && !block_arguments.is_empty() {
-            function.inputs = block_arguments
-                .iter()
-                .enumerate()
-                .map(|(index, value)| ParsedValue {
-                    name: value.name.clone(),
-                    type_text: value
-                        .type_text
-                        .clone()
-                        .or_else(|| function_inputs.get(index).cloned()),
-                })
-                .collect();
-        }
         for value in block_arguments {
             upsert_value(&mut function.values, value);
         }

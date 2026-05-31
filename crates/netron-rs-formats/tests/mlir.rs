@@ -191,3 +191,44 @@ fn parses_module_globals_and_torch_constant_folding() {
             .any(|node| node["operator"]["name"] == "prims.convert_element_type")
     );
 }
+
+#[test]
+fn keeps_cfg_block_arguments_out_of_function_inputs() {
+    let data = br#"func.func @loop() {
+  ^bb1(%i: index):
+    return
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("loop.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(normalized["functions"][0]["name"], "@loop");
+    assert_eq!(normalized["functions"][0]["inputs"], json!([]));
+}
+
+#[test]
+fn anonymous_module_wrappers_do_not_emit_graphs_or_prefix_functions() {
+    let data = br#"module {
+  func.func @main() {
+    return
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("anonymous.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(normalized["graphs"].as_array().unwrap().len(), 0);
+    assert_eq!(normalized["functions"][0]["name"], "@main");
+}
