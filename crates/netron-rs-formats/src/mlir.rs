@@ -56,13 +56,12 @@ fn is_mlir_line(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("module ")
         || line.starts_with("\"builtin.module\"")
+        || line.starts_with("vm.module ")
         || line.starts_with("func ")
         || line.starts_with("func.func ")
         || line.starts_with('#') && line.contains('=')
         || line.split_whitespace().next().is_some_and(|token| {
             normalized_operator_token_from_token(token).is_some_and(is_function_start_token)
-                || normalized_operator_token_from_token(token)
-                    .is_some_and(|name| name == "module" || name == "builtin.module")
         })
         || line.contains("tensor<")
         || line.contains("memref<")
@@ -109,7 +108,10 @@ fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
     model.metadata.properties = parsed.metadata;
 
     for module in parsed.modules {
-        if module.name.is_empty() && module.metadata.is_empty() && module.nodes.is_empty() {
+        if module.metadata.is_empty()
+            && module.nodes.is_empty()
+            && (module.name.is_empty() || module.synthetic)
+        {
             continue;
         }
         let name = (!module.name.is_empty()).then(|| model.intern(&module.name));
@@ -351,6 +353,7 @@ struct ParsedModel {
 
 struct ParsedModule {
     name: String,
+    synthetic: bool,
     metadata: BTreeMap<String, String>,
     nodes: Vec<ParsedNode>,
 }
@@ -401,6 +404,7 @@ enum ParsedAttributeValue {
 
 struct ModuleScope {
     name: String,
+    synthetic: bool,
     open_depth: isize,
     parsed_index: Option<usize>,
 }
@@ -423,6 +427,8 @@ struct CapturedLine {
 fn parse_text(text: &str) -> ParsedModel {
     let mut parsed = ParsedModel::default();
     let mut depth = 0isize;
+    let synthesize_anonymous_modules = anonymous_module_count(text) > 1;
+    let mut anonymous_module_counter = 0usize;
     let mut modules = Vec::<ModuleScope>::new();
     let mut alias: Option<(String, String)> = None;
     let mut header: Option<(usize, String, Option<String>)> = None;
@@ -513,22 +519,28 @@ fn parse_text(text: &str) -> ParsedModel {
             }
         }
 
-        if let Some(module) = parse_module(trimmed) {
+        if let Some(module) = parse_module(
+            trimmed,
+            synthesize_anonymous_modules,
+            &mut anonymous_module_counter,
+        ) {
             parsed.modules.push(module);
-            let parsed_index = Some(parsed.modules.len() - 1);
-            let name = parsed
-                .modules
-                .get(parsed_index.unwrap_or(0))
-                .map(|module| module.name.clone())
-                .unwrap_or_default();
+            let parsed_index = parsed.modules.len() - 1;
+            let module = &parsed.modules[parsed_index];
             modules.push(ModuleScope {
-                name,
+                name: module.name.clone(),
+                synthetic: module.synthetic,
                 open_depth: before,
-                parsed_index,
+                parsed_index: Some(parsed_index),
             });
         }
 
         if is_function_start(trimmed) {
+            if suppress_executable_function(&parsed, &modules, trimmed) {
+                depth += brace_delta(&line);
+                pop_modules(&mut modules, depth);
+                continue;
+            }
             let prefix = module_prefix(&modules);
             if has_body_open(trimmed) {
                 let after = before + brace_delta(&line);
@@ -594,6 +606,22 @@ fn parse_text(text: &str) -> ParsedModel {
     }
     finalize_location_metadata(&mut parsed);
     parsed
+}
+
+fn anonymous_module_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            is_module_start(line) && parse_module_name(line).is_none()
+        })
+        .count()
+}
+
+fn is_module_start(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("module ")
+        || line.starts_with("\"builtin.module\"")
+        || line.starts_with("vm.module ")
 }
 
 fn finalize_location_metadata(parsed: &mut ParsedModel) {
@@ -745,8 +773,13 @@ fn pop_modules(modules: &mut Vec<ModuleScope>, depth: isize) {
 }
 
 fn module_prefix(modules: &[ModuleScope]) -> Option<String> {
+    let named_start = modules
+        .iter()
+        .position(|module| !module.synthetic && !module.name.is_empty())
+        .unwrap_or(0);
     let parts = modules
         .iter()
+        .skip(named_start)
         .map(|module| module.name.as_str())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
@@ -757,10 +790,47 @@ fn module_prefix(modules: &[ModuleScope]) -> Option<String> {
     }
 }
 
-fn parse_module(line: &str) -> Option<ParsedModule> {
-    let rest = if let Some(rest) = line.strip_prefix("module ") {
+fn suppress_executable_function(
+    parsed: &ParsedModel,
+    modules: &[ModuleScope],
+    header: &str,
+) -> bool {
+    let Some(function_name) = parse_function_name(header) else {
+        return false;
+    };
+    let Some(module_index) = modules.last().and_then(|module| module.parsed_index) else {
+        return false;
+    };
+    parsed.modules.get(module_index).is_some_and(|module| {
+        module.nodes.iter().any(|node| {
+            matches!(node.operator.as_str(), "flow.executable" | "hal.executable")
+                && node_symbol_name(node).is_some_and(|name| name == function_name)
+        })
+    })
+}
+
+fn node_symbol_name(node: &ParsedNode) -> Option<&str> {
+    node.attributes.iter().find_map(|attribute| {
+        (attribute.name == "sym_name").then(|| match &attribute.value {
+            ParsedAttributeValue::String(value) | ParsedAttributeValue::Reference(value) => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })?
+    })
+}
+
+fn parse_module(
+    line: &str,
+    synthesize_anonymous: bool,
+    anonymous_counter: &mut usize,
+) -> Option<ParsedModule> {
+    let trimmed = line.trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix("module ") {
         rest
-    } else if let Some(rest) = line.strip_prefix("\"builtin.module\"") {
+    } else if let Some(rest) = trimmed.strip_prefix("\"builtin.module\"") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("vm.module ") {
         rest
     } else {
         return None;
@@ -768,19 +838,34 @@ fn parse_module(line: &str) -> Option<ParsedModule> {
     let metadata = extract_attribute_dict(rest)
         .map(parse_metadata_dict)
         .unwrap_or_default();
-    let explicit_name = rest
-        .split_whitespace()
-        .find(|value| value.starts_with('@'))
-        .filter(|value| value.starts_with('@'));
-    let name = explicit_name
-        .map(|name| name.to_owned())
-        .or_else(|| metadata.get("sym_name").cloned())
-        .unwrap_or_default();
+    let explicit_name = parse_module_name(line).or_else(|| metadata.get("sym_name").cloned());
+    let synthetic = explicit_name.is_none() && synthesize_anonymous;
+    let name = explicit_name.unwrap_or_else(|| {
+        if synthesize_anonymous {
+            let name = format!("${anonymous_counter}");
+            *anonymous_counter += 1;
+            name
+        } else {
+            String::new()
+        }
+    });
     Some(ParsedModule {
         name,
+        synthetic,
         metadata,
         nodes: Vec::new(),
     })
+}
+
+fn parse_module_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("module ")
+        .or_else(|| trimmed.strip_prefix("\"builtin.module\""))
+        .or_else(|| trimmed.strip_prefix("vm.module "))?;
+    rest.split_whitespace()
+        .find(|value| value.starts_with('@'))
+        .map(str::to_owned)
 }
 
 fn is_function_start(line: &str) -> bool {
@@ -1095,6 +1180,13 @@ fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<Par
             type_text: output_types.get(index).cloned(),
         })
         .collect::<Vec<_>>();
+    if operator == "tt.load" {
+        for value in &mut values {
+            if let Some(type_text) = value.type_text.as_deref().and_then(triton_load_result_type) {
+                value.type_text = Some(type_text);
+            }
+        }
+    }
     if operator == "torch.constant" && output_types.is_empty() {
         for value in &mut values {
             value.type_text = Some("none".to_owned());
@@ -1131,6 +1223,12 @@ fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<Par
     if operator == "affine.for" {
         attributes.extend(parse_affine_for_attrs(remainder));
         inputs.clear();
+    }
+    if operator == "scf.for" {
+        attributes.push(ParsedAttribute {
+            name: "operandSegmentSizes".to_owned(),
+            value: ParsedAttributeValue::Ints(parse_scf_for_operand_segments(remainder)),
+        });
     }
     if operator == "arm_sme.tile_load" {
         if let Some(layout) = angle_argument(remainder, "layout") {
@@ -1185,6 +1283,16 @@ fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<Par
         attributes.push(ParsedAttribute {
             name: "layout".to_owned(),
             value: ParsedAttributeValue::String(layout),
+        });
+    }
+    if operator == "tt.load" && inputs.len() > 1 {
+        attributes.push(ParsedAttribute {
+            name: "operandSegmentSizes".to_owned(),
+            value: ParsedAttributeValue::Ints(vec![
+                1,
+                i64::from(inputs.len() > 1),
+                i64::from(inputs.len() > 2),
+            ]),
         });
     }
     if is_arm_sme_product(&operator) {
@@ -1290,6 +1398,9 @@ fn parse_inputs(operator: &str, remainder: &str) -> Vec<String> {
     if operator == "cf.cond_br" {
         return extract_value_names(remainder).into_iter().take(1).collect();
     }
+    if operator == "scf.for" {
+        return parse_scf_for_inputs(remainder);
+    }
     if operator.ends_with(".for") {
         return Vec::new();
     }
@@ -1324,10 +1435,75 @@ fn parse_dimension_indices(remainder: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_scf_for_inputs(remainder: &str) -> Vec<String> {
+    let mut inputs = Vec::new();
+    let Some(equal) = remainder.find('=') else {
+        return inputs;
+    };
+    let after_equal = remainder[equal + 1..].trim_start();
+    let Some(to_index) = after_equal.find(" to ") else {
+        return inputs;
+    };
+    let lower = after_equal[..to_index].trim();
+    if lower.starts_with('%') {
+        inputs.push(lower.to_owned());
+    }
+    let after_to = &after_equal[to_index + 4..];
+    let Some(step_index) = after_to.find(" step ") else {
+        return inputs;
+    };
+    let upper = after_to[..step_index].trim();
+    if upper.starts_with('%') {
+        inputs.push(upper.to_owned());
+    }
+    let after_step = &after_to[step_index + 6..];
+    let step_end = after_step
+        .find(" iter_args(")
+        .or_else(|| after_step.find(" {"))
+        .or_else(|| after_step.find(" ->"))
+        .unwrap_or(after_step.len());
+    let step = after_step[..step_end].trim();
+    if step.starts_with('%') {
+        inputs.push(step.to_owned());
+    }
+    if let Some(iter_inputs) = parse_scf_for_iter_arg_inputs(remainder) {
+        inputs.extend(iter_inputs);
+    }
+    inputs
+}
+
+fn parse_scf_for_iter_arg_inputs(remainder: &str) -> Option<Vec<String>> {
+    let marker = "iter_args(";
+    let open = remainder.find(marker)? + marker.len() - 1;
+    let close = matching_delimiter(remainder, open, '(', ')')?;
+    Some(
+        split_top_level(&remainder[open + 1..close], ',')
+            .into_iter()
+            .filter_map(|part| {
+                let (_, value) = part.split_once('=')?;
+                let value = value.trim();
+                value.starts_with('%').then(|| value.to_owned())
+            })
+            .collect(),
+    )
+}
+
+fn parse_scf_for_operand_segments(remainder: &str) -> Vec<i64> {
+    let iter_args = parse_scf_for_iter_arg_inputs(remainder)
+        .map(|inputs| inputs.len() as i64)
+        .unwrap_or(0);
+    vec![1, 1, 1, iter_args]
+}
+
 fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Vec<ParsedAttribute> {
-    let mut attributes = extract_attribute_dict(remainder)
-        .map(parse_attribute_dict)
-        .unwrap_or_default();
+    let mut attributes = if operator == "scf.for" {
+        Vec::new()
+    } else {
+        extract_attribute_dict(remainder)
+            .map(parse_attribute_dict)
+            .unwrap_or_default()
+    };
+    attributes.extend(parse_symbol_attributes(operator, remainder));
     if operator == "util.global" {
         return parse_util_global_attributes(remainder);
     }
@@ -1487,6 +1663,73 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
                 type_text: dense_payload_type(remainder).or_else(|| type_annotation(remainder)),
                 len: dense_literal_count(remainder),
             },
+        });
+    }
+    if (operator == "vm.rodata" || operator.ends_with(".rodata")) && has_dense_payload(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "value".to_owned(),
+            value: ParsedAttributeValue::Tensor {
+                type_text: dense_payload_type(remainder).or_else(|| type_annotation(remainder)),
+                len: dense_literal_count(remainder),
+            },
+        });
+    }
+    if operator == "tt.get_program_id"
+        && let Some(axis) = remainder
+            .split_once(':')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(remainder)
+            .split_whitespace()
+            .next()
+        && matches!(axis, "x" | "y" | "z")
+    {
+        attributes.push(ParsedAttribute {
+            name: "axis".to_owned(),
+            value: ParsedAttributeValue::String(axis.to_owned()),
+        });
+    }
+    attributes
+}
+
+fn parse_symbol_attributes(operator: &str, remainder: &str) -> Vec<ParsedAttribute> {
+    if !matches!(
+        operator,
+        "flow.executable"
+            | "hal.executable"
+            | "hal.executable.variant"
+            | "hal.executable.entry_point"
+            | "vm.rodata"
+            | "vm.import"
+            | "vm.export"
+    ) && !operator.starts_with("vm.global.")
+    {
+        return Vec::new();
+    }
+    let prefix = remainder
+        .split_once('=')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(remainder);
+    let prefix = prefix
+        .split_once('{')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(prefix);
+    let mut attributes = Vec::new();
+    if let Some(sym_visibility) = prefix.split_whitespace().find_map(|token| {
+        matches!(token, "public" | "private" | "nested").then(|| token.to_owned())
+    }) {
+        attributes.push(ParsedAttribute {
+            name: "sym_visibility".to_owned(),
+            value: ParsedAttributeValue::String(sym_visibility),
+        });
+    }
+    if let Some(sym_name) = prefix
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix('@'))
+        .map(|name| name.trim_end_matches(',').to_owned())
+    {
+        attributes.push(ParsedAttribute {
+            name: "sym_name".to_owned(),
+            value: ParsedAttributeValue::String(sym_name),
         });
     }
     attributes
@@ -2362,6 +2605,11 @@ fn result_types(operator: &str, rhs: &str, count: usize) -> Vec<String> {
                 return vec![type_text.clone()];
             }
         }
+        if operator == "tt.load"
+            && let Some(type_text) = triton_load_result_type(clean_type_token(suffix))
+        {
+            return vec![type_text];
+        }
         if count > 1 {
             return split_type_list(suffix, count);
         }
@@ -2380,10 +2628,26 @@ fn scalar_tensor_as_vector(type_text: &str) -> Option<String> {
     (!inner.contains('x')).then(|| format!("tensor<1x{inner}>"))
 }
 
+fn triton_load_result_type(type_text: &str) -> Option<String> {
+    let inner = bracket_inner(type_text.trim(), "tensor<")?;
+    let parts = split_top_level(inner, ',');
+    let shaped = parts.first()?.trim();
+    let (shape, pointer) = shaped.rsplit_once('x')?;
+    let element = bracket_inner(pointer.trim(), "!tt.ptr<")?;
+    let layout = parts
+        .get(1..)
+        .filter(|parts| !parts.is_empty())
+        .map(|parts| format!(", {}", parts.join(", ")))
+        .unwrap_or_default();
+    Some(format!("tensor<{shape}x{element}{layout}>"))
+}
+
 fn split_type_list(text: &str, count: usize) -> Vec<String> {
     let cleaned = clean_type_list(text.trim());
-    let inner = if cleaned.starts_with('(') && cleaned.ends_with(')') {
-        &cleaned[1..cleaned.len() - 1]
+    let inner = if cleaned.starts_with('(') {
+        matching_delimiter(cleaned, 0, '(', ')')
+            .map(|close| &cleaned[1..close])
+            .unwrap_or(cleaned)
     } else {
         cleaned
     };

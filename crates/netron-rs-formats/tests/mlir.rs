@@ -213,6 +213,75 @@ fn keeps_cfg_block_arguments_out_of_function_inputs() {
 }
 
 #[test]
+fn parses_scf_for_bounds_and_iter_args_as_inputs() {
+    let data = br#"func.func @loop(%arg0: tensor<4xf32>) {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  %c1 = arith.constant 1 : index
+  %init = arith.constant dense<0.0> : tensor<4xf32>
+  %0 = scf.for %i = %c0 to %c4 step %c1 iter_args(%acc = %init) -> (tensor<4xf32>) {
+    scf.yield %acc : tensor<4xf32>
+  }
+  return
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("scf-for.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let nodes = normalized["functions"][0]["nodes"].as_array().unwrap();
+    let scf_for = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "scf.for")
+        .unwrap();
+    assert_eq!(scf_for["inputs"], json!(["%c0", "%c4", "%c1", "%init"]));
+    assert_eq!(
+        scf_for["attributes"],
+        json!([
+            { "name": "operandSegmentSizes", "value": { "kind": "ints", "value": [1, 1, 1, 1] } }
+        ])
+    );
+}
+
+#[test]
+fn parses_masked_tt_load_operand_segments() {
+    let data = br#"tt.func @masked(%arg0: tensor<4x!tt.ptr<f16>>, %arg1: tensor<4xi1>) {
+  %0 = tt.load %arg0, %arg1 : tensor<4x!tt.ptr<f16>>
+  tt.return
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("tt-load.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let node = &normalized["functions"][0]["nodes"][0];
+    let loaded = normalized["functions"][0]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["name"] == "%0")
+        .unwrap();
+    assert_eq!(node["operator"]["name"], "tt.load");
+    assert_eq!(loaded["type"]["element_type"], "float16");
+    assert_eq!(
+        node["attributes"],
+        json!([
+            { "name": "operandSegmentSizes", "value": { "kind": "ints", "value": [1, 1, 0] } }
+        ])
+    );
+}
+
+#[test]
 fn anonymous_module_wrappers_do_not_emit_graphs_or_prefix_functions() {
     let data = br#"module {
   func.func @main() {
@@ -231,4 +300,70 @@ fn anonymous_module_wrappers_do_not_emit_graphs_or_prefix_functions() {
         serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
     assert_eq!(normalized["graphs"].as_array().unwrap().len(), 0);
     assert_eq!(normalized["functions"][0]["name"], "@main");
+}
+
+#[test]
+fn repeated_anonymous_modules_get_synthetic_scope_prefixes() {
+    let data = br#"module {
+  tt.func public @a() {
+    tt.return
+  }
+}
+module attributes {"triton_gpu.num-warps" = 16 : i32} {
+  tt.func public @a() {
+    tt.return
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("anonymous-repeated.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(
+        normalized["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["$0::@a", "$1::@a"]
+    );
+    assert_eq!(normalized["graphs"].as_array().unwrap().len(), 1);
+    assert_eq!(normalized["graphs"][0]["name"], "$1");
+    assert_eq!(
+        normalized["graphs"][0]["metadata"]["triton_gpu.num-warps"],
+        "16"
+    );
+}
+
+#[test]
+fn repeated_anonymous_modules_keep_synthetic_function_scope() {
+    let data = br#"module {
+  func.func @main() {
+    return
+  }
+}
+module {
+  func.func @main() {
+    return
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("multi_dump.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(normalized["graphs"].as_array().unwrap().len(), 0);
+    assert_eq!(normalized["functions"][0]["name"], "$0::@main");
+    assert_eq!(normalized["functions"][1]["name"], "$1::@main");
 }
