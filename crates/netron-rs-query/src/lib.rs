@@ -341,6 +341,12 @@ pub struct LayoutResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MlirSymbolEntry {
+    pub handle: EntityHandle,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MlirSummary {
     pub module_count: usize,
     pub function_count: usize,
@@ -4548,6 +4554,24 @@ impl ModelSession {
 
     pub fn layout(&self, scope: &EntityHandle, limits: &SessionLimits) -> Option<LayoutResponse> {
         session_layout(&self.model, &self.index, self.id, scope, limits.clamp())
+    }
+
+    pub fn mlir_symbols(&self, limits: &SessionLimits) -> Option<Vec<MlirSymbolEntry>> {
+        let FormatIndex::Mlir(index) = &self.index else {
+            return None;
+        };
+        Some(
+            index
+                .symbols
+                .iter()
+                .take(limits.clamp().detail)
+                .enumerate()
+                .map(|(symbol, name)| MlirSymbolEntry {
+                    handle: EntityHandle::MlirSymbol { symbol },
+                    name: name.clone(),
+                })
+                .collect(),
+        )
     }
 }
 

@@ -1,5 +1,5 @@
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Output};
 
 #[test]
 fn stats_reports_model_size_without_tensor_materialization() {
@@ -78,6 +78,27 @@ fn search_reports_bounded_query_hits() {
 }
 
 #[test]
+fn search_json_wraps_bounded_query_hits() {
+    let model = write_fixture("search-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("search")
+        .arg(&model)
+        .arg("add")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("run search");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["status"], "ok");
+    assert_eq!(envelope["command"], "search");
+    assert_eq!(envelope["data"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["data"][0]["handle"]["kind"], "node");
+}
+
+#[test]
 fn summary_reports_indexed_session_info() {
     let model = write_fixture("summary.onnx");
     let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
@@ -105,6 +126,24 @@ fn summary_reports_indexed_session_info() {
             .unwrap()
             .starts_with("fnv1a64:")
     );
+}
+
+#[test]
+fn summary_json_wraps_session_info() {
+    let model = write_fixture("summary-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&model)
+        .arg("--json")
+        .output()
+        .expect("run summary");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["status"], "ok");
+    assert_eq!(envelope["command"], "summary");
+    assert_eq!(envelope["data"]["format"], "onnx");
+    assert_eq!(envelope["data"]["graphs"], 1);
 }
 
 #[test]
@@ -141,6 +180,49 @@ fn summary_supports_mlir_input() {
 }
 
 #[test]
+fn mlir_symbols_json_reports_symbol_handles() {
+    let path = write_mlir_fixture(
+        "mlir-symbols",
+        "module @m {\n  func.func @main() {\n    return\n  }\n}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("mlir")
+        .arg("symbols")
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .expect("run mlir symbols");
+    fs::remove_file(&path).unwrap();
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "mlir.symbols");
+    let symbols = envelope["data"].as_array().unwrap();
+    assert!(symbols.iter().any(|symbol| {
+        symbol["handle"]["kind"] == "mlir_symbol"
+            && symbol["name"].as_str().unwrap().contains("main")
+    }));
+}
+
+#[test]
+fn detail_json_reports_entity_fields() {
+    let model = write_fixture("detail-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("detail")
+        .arg(&model)
+        .arg("--node")
+        .arg("0")
+        .arg("--json")
+        .output()
+        .expect("run detail");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "detail");
+    assert_eq!(envelope["data"]["handle"]["kind"], "node");
+    assert_eq!(envelope["data"]["handle"]["node"], 0);
+    assert_eq!(envelope["data"]["fields"]["operator"], "Add");
+}
+
+#[test]
 fn layout_reports_format_independent_view_graph() {
     let model = write_fixture("layout.onnx");
     let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
@@ -172,6 +254,163 @@ fn layout_reports_format_independent_view_graph() {
 }
 
 #[test]
+fn layout_mlir_function_json_reports_projection() {
+    let path = write_mlir_fixture(
+        "layout-mlir-function",
+        "module {\n  func.func @main() {\n    return\n  }\n}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("layout")
+        .arg(&path)
+        .arg("--function")
+        .arg("@main")
+        .arg("--region")
+        .arg("0")
+        .arg("--max-ops")
+        .arg("10")
+        .arg("--json")
+        .output()
+        .expect("run mlir function layout");
+    fs::remove_file(&path).unwrap();
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "layout");
+    assert_eq!(envelope["data"]["scope"]["kind"], "mlir_region");
+    assert_eq!(envelope["data"]["scope"]["region"], 0);
+    assert_eq!(envelope["data"]["limit_used"], 10);
+    assert!(
+        envelope["data"]["cache_key"]
+            .as_str()
+            .unwrap()
+            .contains("layout")
+    );
+}
+
+#[test]
+fn layout_json_reports_session_projection() {
+    let model = write_fixture("layout-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("layout")
+        .arg(&model)
+        .arg("--graph")
+        .arg("0")
+        .arg("--max-nodes")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .expect("run layout");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "layout");
+    assert_eq!(envelope["data"]["scope"]["kind"], "graph");
+    assert_eq!(envelope["data"]["limit_used"], 1);
+    assert!(
+        envelope["data"]["cache_key"]
+            .as_str()
+            .unwrap()
+            .contains("layout")
+    );
+    assert!(envelope["data"]["warnings"].is_array());
+}
+
+#[test]
+fn layout_node_json_returns_slice_projection() {
+    let model = write_fixture("layout-node-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("layout")
+        .arg(&model)
+        .arg("--node")
+        .arg("0")
+        .arg("--depth")
+        .arg("2")
+        .arg("--max-nodes")
+        .arg("2")
+        .arg("--json")
+        .output()
+        .expect("run layout node");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "layout");
+    assert_eq!(envelope["data"]["scope"]["kind"], "node");
+    assert_eq!(envelope["data"]["scope"]["node"], 0);
+    assert_eq!(envelope["data"]["limit_used"], 2);
+    assert!(!envelope["data"]["entities"].as_array().unwrap().is_empty());
+    assert!(
+        envelope["data"]["cache_key"]
+            .as_str()
+            .unwrap()
+            .contains("slice")
+    );
+}
+
+#[test]
+fn onnx_tensor_json_reports_tensor_metadata() {
+    let model = write_fixture("onnx-tensor-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("onnx")
+        .arg("tensor")
+        .arg(&model)
+        .arg("--tensor")
+        .arg("0")
+        .arg("--json")
+        .output()
+        .expect("run onnx tensor");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "onnx.tensor");
+    assert_eq!(envelope["data"]["handle"]["kind"], "tensor");
+    assert_eq!(envelope["data"]["handle"]["tensor"], 0);
+    assert_eq!(envelope["data"]["storage"], "inline_bytes");
+    assert_eq!(envelope["data"]["byte_len"], 12);
+}
+
+#[test]
+fn json_errors_use_stable_exit_codes() {
+    let bad = std::env::temp_dir().join(format!(
+        "netron-rs-unsupported-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&bad, b"not a model").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&bad)
+        .arg("--json")
+        .output()
+        .expect("run summary");
+    fs::remove_file(&bad).unwrap();
+    let envelope = error_json(output, 2);
+    assert_eq!(envelope["command"], "summary");
+    assert_eq!(envelope["error"]["code"], "unsupported_format");
+
+    let model = write_fixture("invalid-layout-json.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("layout")
+        .arg(&model)
+        .arg("--node")
+        .arg("missing")
+        .arg("--json")
+        .output()
+        .expect("run layout");
+    let envelope = error_json(output, 4);
+    assert_eq!(envelope["command"], "layout");
+    assert_eq!(envelope["error"]["code"], "invalid_request");
+
+    let missing = std::env::temp_dir().join("netron-rs-missing-json-error.onnx");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&missing)
+        .arg("--json")
+        .output()
+        .expect("run missing summary");
+    let envelope = error_json(output, 4);
+    assert_eq!(envelope["command"], "summary");
+    assert_eq!(envelope["error"]["code"], "invalid_request");
+}
+
+#[test]
 fn parse_rejects_directory_input() {
     let root = temp_root("netron-rs-directory");
     fs::create_dir_all(&root).unwrap();
@@ -191,6 +430,26 @@ fn parse_rejects_directory_input() {
     );
 }
 
+fn success_json(output: Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn error_json(output: Output, code: i32) -> serde_json::Value {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
 fn temp_root(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "{prefix}-{}",
@@ -199,6 +458,20 @@ fn temp_root(prefix: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn write_mlir_fixture(name: &str, text: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir()
+        .join(format!(
+            "netron-rs-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+        .with_extension("mlir");
+    fs::write(&path, text).unwrap();
+    path
 }
 
 fn write_fixture(name: &str) -> std::path::PathBuf {
