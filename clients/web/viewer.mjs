@@ -5,6 +5,13 @@ const state = {
     summary: null,
     session: null,
     selectedHandle: null,
+    requestEpoch: {
+        search: 0,
+        detail: 0,
+        layout: 0,
+        diagnostics: 0,
+        metadata: 0,
+    },
 };
 
 const nodes = {};
@@ -29,6 +36,7 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('diagnostics-button').addEventListener('click', requestDiagnostics);
     document.getElementById('symbols-button').addEventListener('click', requestMlirSymbols);
     document.getElementById('tensors-button').addEventListener('click', requestOnnxTensors);
+    document.getElementById('cancel-button').addEventListener('click', cancelRequests);
 
     const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
     const transport = vscode ? new VsCodeTransport(vscode) : new DemoTransport();
@@ -46,7 +54,7 @@ window.addEventListener('message', (event) => {
     }
 });
 
-function receiveOpen(response) {
+function receiveOpen(response, logOpen = true) {
     if (response.status !== 'ok') {
         setStatus(response.error?.message || 'Open failed');
         return;
@@ -54,41 +62,63 @@ function receiveOpen(response) {
     const data = response.data;
     state.session = data.session;
     state.client.session = data.session;
-    state.client.requestLog.push('open');
+    state.requestEpoch = {
+        search: 0,
+        detail: 0,
+        layout: 0,
+        diagnostics: 0,
+        metadata: 0,
+    };
+    if (logOpen) {
+        state.client.requestLog.push('open');
+    }
     renderSummary(data.summary);
     setStatus(`Session ${data.session}`);
 }
 
 async function openDemo() {
     const data = await state.client.open('demo.onnx');
-    renderSummary(data.summary);
-    setStatus('Demo session');
+    receiveOpen({ status: 'ok', data }, false);
 }
 
 async function runSearch() {
     const query = nodes.search.value.trim();
+    const requestId = nextRequest('search');
     if (!query || !state.client.session) {
         renderVirtualList(nodes.results, []);
         return;
     }
     try {
         const results = await state.client.search(query, 80);
+        if (requestStale('search', requestId)) {
+            return;
+        }
         renderVirtualList(nodes.results, results, (entry) => searchRow(entry), (entry) => {
             state.selectedHandle = entry.handle;
             requestDetail(entry.handle);
         });
         renderRequestLog();
     } catch (error) {
+        if (requestStale('search', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
 
 async function requestDetail(handle) {
+    const requestId = nextRequest('detail');
     try {
         const detail = await state.client.detail(handle);
+        if (requestStale('detail', requestId)) {
+            return;
+        }
         nodes.detail.replaceChildren(renderDetail(detail));
         renderRequestLog();
     } catch (error) {
+        if (requestStale('detail', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
@@ -99,29 +129,45 @@ async function requestLayout() {
         setStatus('No layout handle');
         return;
     }
+    const requestId = nextRequest('layout');
     try {
+        setStatus('Loading layout');
         const layout = await state.client.layout(handle, 500);
+        if (requestStale('layout', requestId)) {
+            return;
+        }
         drawLayout(layout);
         renderRequestLog();
     } catch (error) {
+        if (requestStale('layout', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
 
 async function requestDiagnostics() {
+    const requestId = nextRequest('diagnostics');
     try {
         const diagnostics = await state.client.diagnostics(100);
+        if (requestStale('diagnostics', requestId)) {
+            return;
+        }
         renderVirtualList(nodes.diagnostics, diagnostics.diagnostics || [], (entry) => {
             const source = entry.source ? ` · ${entry.source}` : '';
             return `${entry.kind}: ${entry.code}${source}`;
         });
         renderRequestLog();
     } catch (error) {
+        if (requestStale('diagnostics', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
 
 async function requestMlirSymbols() {
+    const requestId = nextRequest('metadata');
     if (!state.client.session) {
         setStatus('No open session');
         return;
@@ -133,6 +179,9 @@ async function requestMlirSymbols() {
     }
     try {
         const symbols = await state.client.mlirSymbols(200);
+        if (requestStale('metadata', requestId)) {
+            return;
+        }
         const rows = Array.isArray(symbols) ? symbols : [];
         renderVirtualList(nodes.metadata, rows, (symbol) => symbol.name || compactRow(symbol), (symbol) => {
             if (symbol.handle) {
@@ -143,11 +192,15 @@ async function requestMlirSymbols() {
         setStatus(`Symbols ${rows.length}`);
         renderRequestLog();
     } catch (error) {
+        if (requestStale('metadata', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
 
 async function requestOnnxTensors() {
+    const requestId = nextRequest('metadata');
     if (!state.client.session) {
         setStatus('No open session');
         return;
@@ -168,7 +221,13 @@ async function requestOnnxTensors() {
         setStatus(`Loading ${tensorCount} tensors`);
         const tensors = [];
         for (let tensor = 0; tensor < tensorCount; tensor++) {
+            if (requestStale('metadata', requestId)) {
+                return;
+            }
             tensors.push(await state.client.onnxTensor(tensor, 100));
+        }
+        if (requestStale('metadata', requestId)) {
+            return;
         }
         renderVirtualList(nodes.metadata, tensors, tensorRow, (tensor) => {
             if (tensor.handle) {
@@ -179,11 +238,15 @@ async function requestOnnxTensors() {
         setStatus(total > tensorCount ? `Tensors ${tensorCount} of ${total}` : `Tensors ${tensors.length}`);
         renderRequestLog();
     } catch (error) {
+        if (requestStale('metadata', requestId)) {
+            return;
+        }
         setStatus(error.message);
     }
 }
 
 function renderSummary(summary) {
+    cancelRequests(false);
     state.summary = summary;
     state.selectedHandle = initialLayoutHandle(summary);
     nodes.overview.replaceChildren(...overviewRows(summary).map(([label, value]) => metric(label, value)));
@@ -207,6 +270,24 @@ function renderSummary(summary) {
     renderVirtualList(nodes.diagnostics, []);
     drawEmptyLayout();
     renderRequestLog();
+}
+
+function nextRequest(kind) {
+    state.requestEpoch[kind] += 1;
+    return state.requestEpoch[kind];
+}
+
+function requestStale(kind, requestId) {
+    return requestId !== state.requestEpoch[kind];
+}
+
+function cancelRequests(showStatus = true) {
+    for (const kind of Object.keys(state.requestEpoch)) {
+        state.requestEpoch[kind] += 1;
+    }
+    if (showStatus) {
+        setStatus('Pending requests canceled');
+    }
 }
 
 function metric(label, value) {

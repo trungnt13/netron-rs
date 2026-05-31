@@ -103,7 +103,7 @@ class NetronOverviewProvider {
 <main class="shell">
 <header class="topbar">
 <div><h1>netron-rs</h1><p id="status">Opening indexed session</p></div>
-<div class="actions"><button id="diagnostics-button" type="button">Diagnostics</button><button id="symbols-button" type="button">Symbols</button><button id="tensors-button" type="button">Tensors</button><button id="layout-button" type="button">Layout</button></div>
+<div class="actions"><button id="diagnostics-button" type="button">Diagnostics</button><button id="symbols-button" type="button">Symbols</button><button id="tensors-button" type="button">Tensors</button><button id="layout-button" type="button">Layout</button><button id="cancel-button" type="button">Cancel</button></div>
 </header>
 <section id="overview" class="overview" aria-label="Overview"></section>
 <section class="workbench">

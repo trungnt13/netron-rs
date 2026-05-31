@@ -12,6 +12,7 @@ files backed by `netron-rs serve --stdio`.
 - Files are opened through `open` first and then `summary` is requested.
 - Search, detail, diagnostics, slice, layout, MLIR symbols, and ONNX tensor metadata
   are requested only on user action.
+- Cancel or newer actions invalidate pending webview responses before they render.
 - No `export` (full normalized JSON) request is made on initial open.
 
 ## Configuration

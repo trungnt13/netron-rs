@@ -9,6 +9,8 @@ The UI is overview-first:
   summary;
 - search, detail, diagnostics, slice, layout, MLIR symbols, and ONNX tensor
   metadata are requested after user actions;
+- pending responses are guarded by request epochs so Cancel or newer actions do
+  not let stale responses overwrite the current view;
 - the request log is visible so smoke tests can prove no `export` request happens
   before an explicit export workflow exists.
 
