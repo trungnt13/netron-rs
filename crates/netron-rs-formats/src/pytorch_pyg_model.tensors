@@ -1,0 +1,3 @@
+conv.nn.weight|float32|64,2|512
+conv.nn.bias|float32|64|256
+conv.bias|float32|8|32

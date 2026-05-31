@@ -1,0 +1,10 @@
+features.0.0.weight|float32|32,3,3,3|3456
+features.0.1.weight|float32|32|128
+features.0.1.bias|float32|32|128
+features.0.1.running_mean|float32|32|128
+features.0.1.running_var|float32|32|128
+features.18.0.weight|float32|1280,320,1,1|1638400
+features.18.1.weight|float32|1280|5120
+features.18.1.bias|float32|1280|5120
+features.18.1.running_mean|float32|1280|5120
+features.18.1.running_var|float32|1280|5120

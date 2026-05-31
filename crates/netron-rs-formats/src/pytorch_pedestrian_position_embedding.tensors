@@ -1,0 +1,2 @@
+0.weight|float32|64,2|512
+0.bias|float32|64|256

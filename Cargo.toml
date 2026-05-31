@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/netron-rs-cli",
+    "crates/netron-rs-core",
+    "crates/netron-rs-formats",
+    "crates/netron-rs-layout",
+    "crates/netron-rs-query",
+]
+resolver = "3"
+
+[workspace.package]
+description = "Rust tools for parsing, normalizing, querying, and laying out neural-network model graphs."
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/trungnt13/netron-rs"
+rust-version = "1.94"
+
+[workspace.dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"

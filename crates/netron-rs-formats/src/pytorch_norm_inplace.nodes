@@ -1,0 +1,13 @@
+permute|code/__torch__/torch/nn/modules/module.py:11:16|/workspace/normalizer.py:22:0|%img.1,~,~,~,~|%img0.1|
+to|code/__torch__/torch/nn/modules/module.py:12:14|/workspace/normalizer.py:23:0|%img0.1|%18|
+div|code/__torch__/torch/nn/modules/module.py:13:18|/workspace/normalizer.py:23:0|%18,20|%tensor.1|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:14:26|/workspace/normalizer.py:48:0|mean|%23|
+slice|code/__torch__/torch/nn/modules/module.py:14:14|/workspace/normalizer.py:48:0|%23|%25|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:15:30|/workspace/normalizer.py:48:0|%25|%27|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:15:14|/workspace/normalizer.py:48:0|%27|%28|
+sub_|code/__torch__/torch/nn/modules/module.py:16:19|/workspace/normalizer.py:48:0|%tensor.1,%28|%tensor0.1|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:17:26|/workspace/normalizer.py:48:0|std|%33|
+slice|code/__torch__/torch/nn/modules/module.py:17:14|/workspace/normalizer.py:48:0|%33|%34|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:18:30|/workspace/normalizer.py:48:0|%34|%36|
+unsqueeze|code/__torch__/torch/nn/modules/module.py:18:14|/workspace/normalizer.py:48:0|%36|%37|
+div_|code/__torch__/torch/nn/modules/module.py:19:16|/workspace/normalizer.py:48:0|%tensor0.1,%37|%40|

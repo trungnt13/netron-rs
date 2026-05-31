@@ -1,0 +1,2 @@
+quant.scale|float32|1|4
+quant.zero_point|int64|1|8

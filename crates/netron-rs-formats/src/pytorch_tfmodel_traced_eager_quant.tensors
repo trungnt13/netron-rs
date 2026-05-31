@@ -1,0 +1,9 @@
+feature_extraction.1.weight|float32|1|4
+Encoder_1.norm.weight|float32|22|88
+Encoder_1.norm.bias|float32|22|88
+Encoder_2.norm.weight|float32|22|88
+Encoder_2.norm.bias|float32|22|88
+Decoder_1.norm.weight|float32|22|88
+Decoder_1.norm.bias|float32|22|88
+Decoder_2.norm.weight|float32|22|88
+Decoder_2.norm.bias|float32|22|88

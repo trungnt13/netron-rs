@@ -1,0 +1,13 @@
+[package]
+name = "netron-rs-layout"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netron-rs-core = { version = "0.1.0", path = "../netron-rs-core" }
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,4 @@
+lstm.weight_ih_l0|float32|512,64|131072
+lstm.weight_hh_l0|float32|512,128|262144
+lstm.bias_ih_l0|float32|512|2048
+lstm.bias_hh_l0|float32|512|2048

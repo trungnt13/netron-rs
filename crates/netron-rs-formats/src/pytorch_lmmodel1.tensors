@@ -1,0 +1,5 @@
+i_h.weight|float32|10,10|400
+h_h.weight|float32|10,10|400
+h_h.bias|float32|10|40
+h_o.weight|float32|10,10|400
+h_o.bias|float32|10|40

@@ -1,0 +1,12 @@
+jsd.conv_pre.1.weight|float32|512,128,7|1835008
+jsd.conv_pre.1.bias|float32|512|2048
+jsd.ups_u.0.weight|float32|512,256,6|3145728
+jsd.ups_u.0.bias|float32|256|1024
+jsd.ups_u.1.weight|float32|256,128,10|1310720
+jsd.ups_u.1.bias|float32|128|512
+jsd.ups_u.2.weight|float32|128,64,10|327680
+jsd.ups_u.2.bias|float32|64|256
+jsd.ups_u.3.weight|float32|64,64,4|65536
+jsd.ups_u.3.bias|float32|64|256
+jsd.conv_post_u.weight|float32|4,64,7|7168
+jsd.conv_post_u.bias|float32|4|16

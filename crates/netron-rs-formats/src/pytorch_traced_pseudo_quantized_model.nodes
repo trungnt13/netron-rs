@@ -1,0 +1,2 @@
+linear|code/__torch__/torch/nn/modules/linear.py:13:16|/python/site-packages/torch/nn/modules/linear.py:125:0|%x.1,linear.weight,linear.bias|%30
+relu|code/__torch__/torch/nn/modules/activation.py:8:16|/python/site-packages/torch/nn/functional.py:1704:0|%30|%32

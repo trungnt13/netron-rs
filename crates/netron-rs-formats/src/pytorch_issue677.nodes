@@ -1,0 +1,5 @@
+conv2d|code/__torch__/torch/nn/modules/conv.py:25:14|/python/site-packages/torch/nn/modules/conv.py:415:15|%input.1,_conv1.weight,_conv1.bias,~,~,~,~,~,~|%y1.1|
+conv2d|code/__torch__/torch/nn/modules/conv/___torch_mangle_0.py:25:14|/python/site-packages/torch/nn/modules/conv.py:415:15|%y1.1,_conv2.weight,_conv2.bias,~,~,~,~,~,~|%y2.1|
+conv2d|code/__torch__/torch/nn/modules/conv/___torch_mangle_1.py:25:14|/python/site-packages/torch/nn/modules/conv.py:415:15|%y2.1,_conv3.weight,_conv3.bias,~,~,~,~,~,~|%y3.1|
+conv2d|code/__torch__/torch/nn/modules/conv/___torch_mangle_2.py:25:14|/python/site-packages/torch/nn/modules/conv.py:415:15|%input.1,_conv_aux.weight,_conv_aux.bias,~,~,~,~,~,~|%aux.1|
+DictConstruct|||~,%y2.1,%y3.1,%aux.1,~,~|%30|

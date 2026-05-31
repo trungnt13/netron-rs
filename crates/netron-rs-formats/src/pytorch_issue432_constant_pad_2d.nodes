@@ -1,0 +1,4 @@
+constant_pad_nd|code/__torch__/___torch_mangle_15.py:9:14|/python/site-packages/torch\nn\functional.py:2848:0|%input.1,~,~,~,~|%9|
+permute|code/__torch__/___torch_mangle_15.py:10:18|<ipython-input-14-d257270ab789>:7:0|%input.1,~,~,~,~|%input0.1|
+constant_pad_nd|code/__torch__/___torch_mangle_15.py:11:14|/python/site-packages/torch\nn\functional.py:2848:0|%input0.1,~,~,~,~|%15|
+TupleConstruct|||%9,%15|%18|

@@ -1,0 +1,6 @@
+mlp.0.weight|float32|100,257|102800
+mlp.0.bias|float32|100|400
+mlp.3.weight|float32|16,100|6400
+mlp.3.bias|float32|16|64
+mlp.6.weight|float32|1,16|64
+mlp.6.bias|float32|1|4

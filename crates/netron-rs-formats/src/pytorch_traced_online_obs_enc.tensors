@@ -1,0 +1,15 @@
+131|int64||8
+embed.0.weight|float32|64,8|2048
+embed.0.bias|float32|64|256
+h0|float32|2,1,128|1024
+c0|float32|2,1,128|1024
+vehicle_rnn.weight_ih_l0|float32|512,64|131072
+vehicle_rnn.weight_hh_l0|float32|512,128|262144
+vehicle_rnn.bias_ih_l0|float32|512|2048
+vehicle_rnn.bias_hh_l0|float32|512|2048
+vehicle_rnn.weight_ih_l0_reverse|float32|512,64|131072
+vehicle_rnn.weight_hh_l0_reverse|float32|512,128|262144
+vehicle_rnn.bias_ih_l0_reverse|float32|512|2048
+vehicle_rnn.bias_hh_l0_reverse|float32|512|2048
+encode.0.weight|float32|128,1024|524288
+encode.0.bias|float32|128|512

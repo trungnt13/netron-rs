@@ -1,0 +1,2 @@
+backbone.fpn.inner_blocks.2.weight|float32|256,2048,1,1|2097152
+backbone.fpn.inner_blocks.2.bias|float32|256|1024

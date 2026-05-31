@@ -1,0 +1,15 @@
+51|int64||8
+embed.0.weight|float32|64,4|1024
+embed.0.bias|float32|64|256
+h0|float32|2,1,128|1024
+c0|float32|2,1,128|1024
+single_lane_rnn.weight_ih_l0|float32|512,64|131072
+single_lane_rnn.weight_hh_l0|float32|512,128|262144
+single_lane_rnn.bias_ih_l0|float32|512|2048
+single_lane_rnn.bias_hh_l0|float32|512|2048
+single_lane_rnn.weight_ih_l0_reverse|float32|512,64|131072
+single_lane_rnn.weight_hh_l0_reverse|float32|512,128|262144
+single_lane_rnn.bias_ih_l0_reverse|float32|512|2048
+single_lane_rnn.bias_hh_l0_reverse|float32|512|2048
+encode.0.weight|float32|127,1024|520192
+encode.0.bias|float32|127|508

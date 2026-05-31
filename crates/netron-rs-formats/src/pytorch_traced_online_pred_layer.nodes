@@ -1,0 +1,10 @@
+t|||mlp.0.weight|%6
+addmm|||mlp.0.bias,%input_1.1,%6|%input_2.1
+threshold|||%input_2.1|%input_3.1
+dropout|||%input_3.1|%input_4.1
+t|||mlp.3.weight|%25
+addmm|||mlp.3.bias,%input_4.1,%25|%input_5.1
+threshold|||%input_5.1|%input_6.1
+dropout|||%input_6.1|%input.1
+t|||mlp.6.weight|%42
+addmm|||mlp.6.bias,%input.1,%42|%49

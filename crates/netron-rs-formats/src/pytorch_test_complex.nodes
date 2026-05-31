@@ -1,0 +1,7 @@
+If|code/__torch__.py:9:4|/workspace/test_complex.py:8:32|%flag.1|%44
+add|code/__torch__.py:13:18|/workspace/test_complex.py:8:26|%44|%c1_mod.1
+abs|code/__torch__.py:14:29|/workspace/test_complex.py:9:16|%c1_mod.1|%21
+add|code/__torch__.py:14:13|/workspace/test_complex.py:9:12|%x.1,%21|%y.1
+If|code/__torch__.py:15:4|/workspace/test_complex.py:12:8|%flag.1|%c2
+abs|code/__torch__.py:19:32|/workspace/test_complex.py:16:19|%c2|%38
+add|code/__torch__.py:19:16|/workspace/test_complex.py:16:15|%y.1,%38|%40
