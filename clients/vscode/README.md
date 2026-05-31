@@ -29,5 +29,5 @@ Set `netronRsViewer.binaryPath` if `netron-rs` is not on `PATH`:
 Run the syntax check from `netron-rs/clients/vscode`:
 
 ```bash
-npm run lint
+npm run check
 ```

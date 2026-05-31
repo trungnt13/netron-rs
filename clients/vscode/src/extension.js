@@ -103,13 +103,13 @@ class NetronOverviewProvider {
 <main class="shell">
 <header class="topbar">
 <div><h1>netron-rs</h1><p id="status">Opening indexed session</p></div>
-<div class="actions"><button id="diagnostics-button" type="button">Diagnostics</button><button id="layout-button" type="button">Layout</button></div>
+<div class="actions"><button id="diagnostics-button" type="button">Diagnostics</button><button id="symbols-button" type="button">Symbols</button><button id="tensors-button" type="button">Tensors</button><button id="layout-button" type="button">Layout</button></div>
 </header>
 <section id="overview" class="overview" aria-label="Overview"></section>
 <section class="workbench">
 <aside class="panel"><label class="search"><span>Search</span><input id="search" type="search" autocomplete="off"></label><div id="results" class="virtual-list" aria-label="Search results"></div></aside>
 <section class="panel main-panel"><canvas id="layout" width="960" height="540" aria-label="Bounded layout"></canvas></section>
-<aside class="panel"><div id="detail" class="detail" aria-label="Detail"></div><h2>Diagnostics</h2><div id="diagnostics" class="virtual-list small" aria-label="Diagnostics"></div></aside>
+<aside class="panel"><div id="detail" class="detail" aria-label="Detail"></div><h2>Metadata</h2><div id="metadata" class="virtual-list small" aria-label="Metadata"></div><h2>Diagnostics</h2><div id="diagnostics" class="virtual-list small" aria-label="Diagnostics"></div></aside>
 </section>
 <section id="lists" class="lists" aria-label="Indexed lists"></section>
 <footer><code id="request-log"></code></footer>

@@ -7,8 +7,8 @@ The UI is overview-first:
 
 - initial load receives only the service `open` response with session id and
   summary;
-- search, detail, diagnostics, slice, and layout are requested after user
-  actions;
+- search, detail, diagnostics, slice, layout, MLIR symbols, and ONNX tensor
+  metadata are requested after user actions;
 - the request log is visible so smoke tests can prove no `export` request happens
   before an explicit export workflow exists.
 

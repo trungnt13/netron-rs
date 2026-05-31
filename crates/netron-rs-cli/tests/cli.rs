@@ -422,6 +422,17 @@ fn service_stdio_matches_cli_for_shared_operations() {
             .output()
             .expect("run cli summary"),
     );
+    let cli_tensor = success_json(
+        Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+            .arg("onnx")
+            .arg("tensor")
+            .arg(&onnx)
+            .arg("--tensor")
+            .arg("0")
+            .arg("--json")
+            .output()
+            .expect("run cli tensor"),
+    );
 
     let mlir = write_mlir_fixture(
         "service-search",
@@ -437,6 +448,15 @@ fn service_stdio_matches_cli_for_shared_operations() {
             .arg("--json")
             .output()
             .expect("run cli search"),
+    );
+    let cli_symbols = success_json(
+        Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+            .arg("mlir")
+            .arg("symbols")
+            .arg(&mlir)
+            .arg("--json")
+            .output()
+            .expect("run cli mlir symbols"),
     );
 
     let mut service = ServiceProcess::spawn();
@@ -494,8 +514,15 @@ fn service_stdio_matches_cli_for_shared_operations() {
     }));
     assert_eq!(layout["data"]["scope"]["kind"], "graph");
     assert_eq!(layout["data"]["limit_used"], 1);
-    let export = service.request(serde_json::json!({
+    let tensor = service.request(serde_json::json!({
         "id": 25,
+        "method": "onnx.tensor",
+        "params": { "session": onnx_session, "tensor": 0 }
+    }));
+    assert_eq!(tensor["command"], "onnx.tensor");
+    assert_eq!(tensor["data"], cli_tensor["data"]);
+    let export = service.request(serde_json::json!({
+        "id": 26,
         "method": "export",
         "params": { "session": onnx_session, "limit": 5 }
     }));
@@ -517,8 +544,15 @@ fn service_stdio_matches_cli_for_shared_operations() {
     }));
     assert_eq!(search["command"], "search");
     assert_eq!(search["data"], cli_search["data"]);
+    let symbols = service.request(serde_json::json!({
+        "id": 6,
+        "method": "mlir.symbols",
+        "params": { "session": mlir_session, "limit": 20 }
+    }));
+    assert_eq!(symbols["command"], "mlir.symbols");
+    assert_eq!(symbols["data"], cli_symbols["data"]);
     let close = service.request(serde_json::json!({
-        "id": 5,
+        "id": 7,
         "method": "close",
         "params": { "session": mlir_session }
     }));

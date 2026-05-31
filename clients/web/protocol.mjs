@@ -35,6 +35,14 @@ export class ProjectionClient {
         return this.request('layout', { session: this.requireSession(), handle, max_nodes: maxNodes });
     }
 
+    async mlirSymbols(limit = 200) {
+        return this.request('mlir.symbols', { session: this.requireSession(), limit });
+    }
+
+    async onnxTensor(tensor, limit = 200) {
+        return this.request('onnx.tensor', { session: this.requireSession(), tensor, limit });
+    }
+
     async request(method, params) {
         this.requestLog.push(method);
         const response = await this.transport.request(method, params);
@@ -94,14 +102,16 @@ export function summaryLists(summary) {
             ['Graphs', summary.onnx.graph_summaries || []],
             ['Operators', summary.onnx.histograms?.operator_types || []],
             ['Tensors', summary.onnx.histograms?.storage_kinds || []],
+            ['Domains', summary.onnx.histograms?.domains || []],
         ];
     }
     if (summary.mlir) {
         return [
             ['Modules', summary.mlir.modules || []],
             ['Functions', summary.mlir.functions || []],
+            ['Regions', summary.mlir.regions || []],
+            ['Blocks', summary.mlir.blocks || []],
             ['Dialects', (summary.mlir.dialects || []).map((name) => ({ key: name, count: 1 }))],
-            ['Resources', summary.mlir.resources || []],
         ];
     }
     return [];

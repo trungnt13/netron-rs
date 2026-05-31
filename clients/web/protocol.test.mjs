@@ -18,6 +18,18 @@ const transport = {
         if (method === 'layout') {
             return ok(method, { limit_used: params.max_nodes, scope: params.handle, graph: { nodes: [], edges: [] } });
         }
+        if (method === 'mlir.symbols') {
+            return ok(method, [{ handle: { kind: 'mlir_symbol', symbol: 0 }, name: '@main' }]);
+        }
+        if (method === 'onnx.tensor') {
+            return ok(method, {
+                handle: { kind: 'tensor', tensor: params.tensor },
+                name: 'weight',
+                element_type: 'float32',
+                shape: ['3'],
+                storage: 'inline_bytes',
+            });
+        }
         return ok(method, {});
     },
 };
@@ -34,7 +46,12 @@ await client.search('add', 1);
 await client.detail({ kind: 'node', graph: 0, node: 4 });
 const layout = await client.layout(initialLayoutHandle(opened.summary), 25);
 assert.equal(layout.limit_used, 25);
-assert.deepEqual(calls.map((call) => call.method), ['open', 'search', 'detail', 'layout']);
+const symbols = await client.mlirSymbols(10);
+assert.equal(symbols[0].name, '@main');
+const tensor = await client.onnxTensor(0, 10);
+assert.equal(tensor.storage, 'inline_bytes');
+assert.deepEqual(calls.map((call) => call.method), ['open', 'search', 'detail', 'layout', 'mlir.symbols', 'onnx.tensor']);
+assert.deepEqual(calls.at(-1).params, { session: 7, tensor: 0, limit: 10 });
 assert.equal(client.requestLog.includes('export'), false);
 
 function ok(command, data) {

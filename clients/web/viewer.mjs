@@ -17,6 +17,7 @@ window.addEventListener('DOMContentLoaded', () => {
         'search',
         'results',
         'detail',
+        'metadata',
         'layout',
         'diagnostics',
         'request-log',
@@ -26,6 +27,8 @@ window.addEventListener('DOMContentLoaded', () => {
     nodes.search.addEventListener('input', debounce(runSearch, 160));
     document.getElementById('layout-button').addEventListener('click', requestLayout);
     document.getElementById('diagnostics-button').addEventListener('click', requestDiagnostics);
+    document.getElementById('symbols-button').addEventListener('click', requestMlirSymbols);
+    document.getElementById('tensors-button').addEventListener('click', requestOnnxTensors);
 
     const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
     const transport = vscode ? new VsCodeTransport(vscode) : new DemoTransport();
@@ -118,6 +121,68 @@ async function requestDiagnostics() {
     }
 }
 
+async function requestMlirSymbols() {
+    if (!state.client.session) {
+        setStatus('No open session');
+        return;
+    }
+    if (state.summary?.format !== 'mlir') {
+        renderVirtualList(nodes.metadata, []);
+        setStatus('Symbols are available for MLIR sessions');
+        return;
+    }
+    try {
+        const symbols = await state.client.mlirSymbols(200);
+        const rows = Array.isArray(symbols) ? symbols : [];
+        renderVirtualList(nodes.metadata, rows, (symbol) => symbol.name || compactRow(symbol), (symbol) => {
+            if (symbol.handle) {
+                state.selectedHandle = symbol.handle;
+                requestDetail(symbol.handle);
+            }
+        });
+        setStatus(`Symbols ${rows.length}`);
+        renderRequestLog();
+    } catch (error) {
+        setStatus(error.message);
+    }
+}
+
+async function requestOnnxTensors() {
+    if (!state.client.session) {
+        setStatus('No open session');
+        return;
+    }
+    if (state.summary?.format !== 'onnx') {
+        renderVirtualList(nodes.metadata, []);
+        setStatus('Tensor metadata is available for ONNX sessions');
+        return;
+    }
+    const total = Number(state.summary?.tensors ?? state.summary?.onnx?.tensor_count ?? 0);
+    const tensorCount = Math.min(Number.isFinite(total) ? total : 0, 100);
+    if (!tensorCount) {
+        renderVirtualList(nodes.metadata, []);
+        setStatus('No tensors');
+        return;
+    }
+    try {
+        setStatus(`Loading ${tensorCount} tensors`);
+        const tensors = [];
+        for (let tensor = 0; tensor < tensorCount; tensor++) {
+            tensors.push(await state.client.onnxTensor(tensor, 100));
+        }
+        renderVirtualList(nodes.metadata, tensors, tensorRow, (tensor) => {
+            if (tensor.handle) {
+                state.selectedHandle = tensor.handle;
+                requestDetail(tensor.handle);
+            }
+        });
+        setStatus(total > tensorCount ? `Tensors ${tensorCount} of ${total}` : `Tensors ${tensors.length}`);
+        renderRequestLog();
+    } catch (error) {
+        setStatus(error.message);
+    }
+}
+
 function renderSummary(summary) {
     state.summary = summary;
     state.selectedHandle = initialLayoutHandle(summary);
@@ -137,6 +202,9 @@ function renderSummary(summary) {
         section.append(heading, list);
         return section;
     }));
+    nodes.metadata.replaceChildren();
+    nodes.detail.replaceChildren();
+    renderVirtualList(nodes.diagnostics, []);
     drawEmptyLayout();
     renderRequestLog();
 }
@@ -153,6 +221,7 @@ function metric(label, value) {
 }
 
 function renderVirtualList(container, rows, label = compactRow, onClick = null) {
+    rows = Array.isArray(rows) ? rows : [];
     const rowHeight = 28;
     const viewport = container.clientHeight || 220;
     const start = Math.floor(container.scrollTop / rowHeight);
@@ -179,12 +248,25 @@ function compactRow(row) {
     if (typeof row === 'string') {
         return row;
     }
-    return row.name || row.key || row.scope_id || row.operator || row.title || JSON.stringify(row.handle || row);
+    if (row.scope_id) {
+        const count = row.operation_count ?? row.block_count ?? row.value_count ?? '';
+        return count === '' ? row.scope_id : `${row.scope_id} · ${count}`;
+    }
+    if (row.count !== undefined) {
+        return `${row.key}: ${row.count}`;
+    }
+    return row.name || row.key || row.operator || row.title || JSON.stringify(row.handle || row);
 }
 
 function searchRow(entry) {
     const title = entry.name || entry.operator || `${entry.kind} ${entry.id}`;
     return `${entry.kind} · ${title}`;
+}
+
+function tensorRow(tensor) {
+    const name = tensor.name || `tensor ${tensor.handle?.tensor ?? ''}`.trim();
+    const shape = Array.isArray(tensor.shape) && tensor.shape.length ? `[${tensor.shape.join(',')}]` : 'scalar';
+    return `${name} · ${tensor.element_type} ${shape} · ${tensor.storage}`;
 }
 
 function renderDetail(detail) {
@@ -325,6 +407,19 @@ class DemoTransport {
         }
         if (method === 'diagnostics') {
             return ok('diagnostics', { diagnostics: [], truncated: false });
+        }
+        if (method === 'onnx.tensor') {
+            return ok('onnx.tensor', {
+                handle: { kind: 'tensor', tensor: params.tensor },
+                name: 'weight',
+                element_type: 'float32',
+                shape: ['3'],
+                storage: 'inline_bytes',
+                byte_len: 12,
+            });
+        }
+        if (method === 'mlir.symbols') {
+            return ok('mlir.symbols', [{ handle: { kind: 'mlir_symbol', symbol: 0 }, name: '@main' }]);
         }
         if (method === 'layout') {
             return ok('layout', demoLayout());
