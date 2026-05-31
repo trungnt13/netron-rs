@@ -1,2 +1,0 @@
-_run_on_gpu_0.features.0.weight|float32|64,3,3,3|6912
-_run_on_gpu_0.features.0.bias|float32|64|256

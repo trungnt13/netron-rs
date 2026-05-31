@@ -1,9 +1,0 @@
-size|code/__torch__/torch/nn/quantized/dynamic/modules/rnn/___torch_mangle_0.py:161:47|/python/site-packages/torch/nn/quantized/dynamic/modules/rnn.py:317:0|%input.1|%35
-NumToTensor|code/__torch__/torch/nn/quantized/dynamic/modules/rnn/___torch_mangle_0.py:161:29|:0:0|%35|%max_batch_size.1
-Int|code/__torch__/torch/nn/quantized/dynamic/modules/rnn/___torch_mangle_0.py:162:25||%max_batch_size.1|%37
-zeros|code/__torch__/torch/nn/quantized/dynamic/modules/rnn/___torch_mangle_0.py:162:14|/python/site-packages/torch/nn/quantized/dynamic/modules/rnn.py:290:0|~,%37,~|%hx.1
-quantized_lstm|code/__torch__/torch/nn/quantized/dynamic/modules/rnn/___torch_mangle_0.py:163:25|/python/site-packages/torch/nn/quantized/dynamic/modules/rnn.py:303:0|%input.1,%hx.1,%hx.1,params|%42,%43,%44
-TupleConstruct|||%43,%44,%42|%45
-TupleUnpack|||%45|%6,%7,%8
-TupleConstruct|||%6,%7|%12
-TupleConstruct|||%8,%12|%13

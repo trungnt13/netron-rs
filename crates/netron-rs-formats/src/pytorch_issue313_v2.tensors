@@ -1,4 +1,0 @@
-conv1.weight|float32|20,1,5,5|2000
-conv1.bias|float32|20|80
-conv2.weight|float32|50,20,5,5|100000
-conv2.bias|float32|50|200

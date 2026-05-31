@@ -1,4 +1,0 @@
-fc1.weight|float32|500,784|1568000
-fc1.bias|float32|500|2000
-fc2.weight|float32|10,500|20000
-fc2.bias|float32|10|40

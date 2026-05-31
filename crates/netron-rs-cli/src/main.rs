@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use memmap2::Mmap;
@@ -152,14 +152,12 @@ struct MappedModel {
 
 enum ModelData {
     Mapped(Mmap),
-    Owned(Vec<u8>),
 }
 
 impl AsRef<[u8]> for ModelData {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Mapped(data) => data,
-            Self::Owned(data) => data,
         }
     }
 }
@@ -168,7 +166,11 @@ impl MappedModel {
     fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let metadata = fs::metadata(path)?;
         if metadata.is_dir() {
-            return Self::open_directory(path);
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported model directory '{}'", path.display()),
+            )
+            .into());
         }
         let file = File::open(path)?;
         // SAFETY: the mmap is read-only and lives as long as every borrowed parser input.
@@ -176,22 +178,6 @@ impl MappedModel {
         Ok(Self {
             path: path.to_owned(),
             data,
-        })
-    }
-
-    fn open_directory(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        if !has_extension(path, "mlpackage") {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                format!("unsupported model directory '{}'", path.display()),
-            )
-            .into());
-        }
-        let model_path = coreml_package_model_path(path)?;
-        let data = fs::read(&model_path)?;
-        Ok(Self {
-            path: model_path,
-            data: ModelData::Owned(data),
         })
     }
 
@@ -205,121 +191,6 @@ impl MappedModel {
     fn len(&self) -> usize {
         self.data.as_ref().len()
     }
-}
-
-fn coreml_package_model_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let manifest_path = path.join("Manifest.json");
-    if manifest_path.is_file() {
-        let manifest = fs::read(&manifest_path)?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest)?;
-        let entries = manifest
-            .get("itemInfoEntries")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| {
-                IoError::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "Core ML package '{}' has no itemInfoEntries",
-                        path.display()
-                    ),
-                )
-            })?;
-        if let Some(root) = manifest
-            .get("rootModelIdentifier")
-            .and_then(serde_json::Value::as_str)
-        {
-            if let Some(entry_path) = entries
-                .get(root)
-                .and_then(|entry| entry.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|entry_path| entry_path.to_ascii_lowercase().ends_with(".mlmodel"))
-            {
-                if let Some(model_path) = coreml_manifest_model_path(path, entry_path)? {
-                    return Ok(model_path);
-                }
-            }
-        }
-        let mut candidates = entries
-            .values()
-            .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
-            .filter(|entry_path| entry_path.to_ascii_lowercase().ends_with(".mlmodel"));
-        if let Some(entry_path) = candidates.next() {
-            if let Some(model_path) = coreml_manifest_model_path(path, entry_path)? {
-                return Ok(model_path);
-            }
-        }
-    }
-
-    find_first_file(path, |candidate| has_extension(candidate, "mlmodel")).ok_or_else(|| {
-        IoError::new(
-            ErrorKind::NotFound,
-            format!(
-                "Core ML package '{}' contains no .mlmodel file",
-                path.display()
-            ),
-        )
-        .into()
-    })
-}
-
-fn coreml_manifest_model_path(
-    package_path: &Path,
-    entry_path: &str,
-) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    if entry_path.contains('\\')
-        || Path::new(entry_path).components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            format!("Core ML package entry path '{entry_path}' escapes package Data directory"),
-        )
-        .into());
-    }
-
-    let data_root = package_path.join("Data");
-    let model_path = data_root.join(entry_path);
-    if !model_path.is_file() {
-        return Ok(None);
-    }
-
-    let data_root = data_root.canonicalize()?;
-    let model_path = model_path.canonicalize()?;
-    if !model_path.starts_with(&data_root) {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            format!("Core ML package entry path '{entry_path}' escapes package Data directory"),
-        )
-        .into());
-    }
-    Ok(Some(model_path))
-}
-
-fn find_first_file(path: &Path, predicate: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    let mut stack = vec![path.to_owned()];
-    while let Some(directory) = stack.pop() {
-        let entries = fs::read_dir(directory).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file() && predicate(&path) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-fn has_extension(path: &Path, expected: &str) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 #[derive(Serialize)]

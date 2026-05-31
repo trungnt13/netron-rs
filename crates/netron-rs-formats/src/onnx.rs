@@ -28,7 +28,21 @@ impl ModelFormat for OnnxFormat {
             .map(|extension| extension.to_ascii_lowercase());
 
         if extension.as_deref() == Some("onnx") {
-            return Confidence::High;
+            if looks_like_json_object(input.data)
+                && parse_json_model_proto(input.data).is_ok_and(|model| model.is_onnx_like())
+            {
+                return Confidence::Medium;
+            }
+            if ModelProto::decode(input.data).is_ok_and(|model| model.is_onnx_like()) {
+                return Confidence::Medium;
+            }
+            if GraphProto::decode(input.data).is_ok_and(|graph| graph.is_graph_like()) {
+                return Confidence::Medium;
+            }
+            if TensorProto::decode(input.data).is_ok_and(|tensor| tensor.is_tensor_like()) {
+                return Confidence::Medium;
+            }
+            return Confidence::None;
         }
 
         if looks_like_json_object(input.data)

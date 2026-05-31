@@ -1,8 +1,0 @@
-_conv1.weight|float32|8,4,3,3|1152
-_conv1.bias|float32|8|32
-_conv2.weight|float32|16,8,3,3|4608
-_conv2.bias|float32|16|64
-_conv3.weight|float32|24,16,3,3|13824
-_conv3.bias|float32|24|96
-_conv_aux.weight|float32|24,4,3,3|3456
-_conv_aux.bias|float32|24|96

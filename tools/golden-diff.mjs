@@ -17,8 +17,8 @@ const main = async () => {
         const target = path.resolve(file);
         const oldModel = await oldNetron(target);
         const rustModel = await rustNetron(target, args.rustBin);
-        const oldSummary = summarizeOld(oldModel, target);
-        const rustSummary = summarizeRust(rustModel, target);
+        const oldSummary = summarizeOld(oldModel);
+        const rustSummary = summarizeRust(rustModel);
         const differences = diff(oldSummary, rustSummary);
         const result = {
             file: target,
@@ -91,19 +91,9 @@ const exec = (command, args, cwd) => new Promise((resolve, reject) => {
     });
 });
 
-const summarizeOld = (model, file) => {
+const summarizeOld = (model) => {
     const options = {
-        tflite: /^TensorFlow Lite\b/.test(model.format?.name || ''),
-        coreml: /^Core ML\b/.test(model.format?.name || ''),
-        darknet: /^Darknet\b/.test(model.format?.name || ''),
-        lightgbm: /^LightGBM\b/.test(model.format?.name || ''),
-        mlir: /^MLIR\b/.test(model.format?.name || ''),
-        ncnn: /^(ncnn|PNNX)\b/.test(model.format?.name || ''),
-        xgboost: /^XGBoost\b/.test(model.format?.name || ''),
-        message: isMessageFile(file),
-        sentencepiece: /^SentencePiece\b/.test(model.format?.name || ''),
-        dot: /^DOT\b/.test(model.format?.name || ''),
-        anonymousValues: /^(Core ML|Darknet|ncnn|PNNX|PyTorch|TorchScript|NumPy Array)\b/.test(model.format?.name || '')
+        mlir: /^MLIR\b/.test(model.format?.name || '')
     };
     return {
         format: normalizeFormat(model.format.name),
@@ -120,10 +110,8 @@ const summarizeOld = (model, file) => {
     };
 };
 
-const summarizeRust = (model, file) => {
-    const options = {
-        message: isMessageFile(file)
-    };
+const summarizeRust = (model) => {
+    const options = {};
     const graphs = (model.graphs || []).filter((graph) => graph.parent === null || graph.parent === undefined);
     const functions = model.functions || [];
     const tensorIds = visibleRustTensorIds(graphs, functions);
@@ -141,8 +129,6 @@ const summarizeRust = (model, file) => {
         }))
     };
 };
-
-const isMessageFile = (file) => ['.message', '.maxviz'].includes(path.extname(file || '').toLowerCase());
 
 const summarizeRustFunction = (func, options = {}) => {
     const values = new Map((func.values || []).map((value) => [value.name, {
@@ -412,7 +398,7 @@ const flattenIds = (items, valueName) => items.flatMap((item) => Array.isArray(i
 
 const flattenNullable = (items) => items.flatMap((item) => Array.isArray(item) ? item : [item]);
 
-const normalizeValueName = (name, options = {}) => options.anonymousValues && (name === null || name === undefined) ? '' : name;
+const normalizeValueName = (name) => name;
 
 const normalizeFormat = (format) => (format || '').split(/\s+/)[0];
 
@@ -504,7 +490,6 @@ const normalizeOperatorDomain = (domain) => {
 };
 
 const summarizeOldAttributes = (attributes, options = {}) => attributes
-    .filter((attribute) => !options.tflite || attribute.visible !== false)
     .map((attribute) => {
     const kind = normalizeOldAttributeKind(attribute, options);
     if (Array.isArray(attribute.ids)) {
@@ -544,48 +529,8 @@ const summarizeOldAttributes = (attributes, options = {}) => attributes
 const normalizeOldAttributeKind = (attribute, options = {}) => {
     const value = attribute.value;
     const normalizedKind = normalizeAttributeKind(attribute.kind);
-    if (options.coreml && Array.isArray(value) && normalizedKind === 'int' && value.every(isIntegerLike)) {
-        return 'ints';
-    }
-    if (options.darknet && normalizedKind === 'int' && !isIntegerLike(value)) {
-        return 'string';
-    }
-    if (options.darknet && normalizedKind === 'float' && Number.isNaN(Number(value))) {
-        return 'string';
-    }
-    if (options.darknet && normalizedKind === 'ints' && !Array.isArray(value)) {
-        return 'string';
-    }
-    if (options.lightgbm && attribute.kind === 'object[]') {
-        return 'strings';
-    }
-    if (options.xgboost && attribute.kind === 'object') {
-        return 'string';
-    }
-    if (options.xgboost && attribute.kind === 'object[]') {
-        return 'strings';
-    }
-    if (options.message) {
-        if (attribute.kind === 'boolean') {
-            return 'int';
-        }
-        if (['SymInt', 'SymInt?', 'Scalar'].includes(attribute.kind)) {
-            return 'string';
-        }
-        if ((attribute.kind === 'Tensor?' || attribute.kind === 'int64?') && (value === null || isEmptyArray(value))) {
-            return 'null';
-        }
-    }
-    if (!(options.tflite || options.coreml || options.darknet || options.lightgbm || options.mlir || options.ncnn || options.xgboost || options.message || options.sentencepiece || options.dot) || attribute.kind !== 'attribute') {
+    if (!options.mlir || attribute.kind !== 'attribute') {
         return normalizedKind;
-    }
-    if (options.sentencepiece && Array.isArray(value) && value.length === 0) {
-        if (['input', 'accept_language', 'control_symbols', 'user_defined_symbols', 'pieces', 'samples'].includes(attribute.name)) {
-            return 'strings';
-        }
-        if (attribute.name === 'precompiled_charsmap') {
-            return 'ints';
-        }
     }
     if (typeof value === 'boolean') {
         return 'boolean';
@@ -598,9 +543,6 @@ const normalizeOldAttributeKind = (attribute, options = {}) => {
     }
     if (typeof value === 'string') {
         return 'string';
-    }
-    if (options.coreml && value === null) {
-        return 'float';
     }
     if (Array.isArray(value)) {
         if (value.every((item) => Number.isInteger(item))) {
@@ -615,17 +557,6 @@ const normalizeOldAttributeKind = (attribute, options = {}) => {
 };
 
 const normalizeOldAttributePayload = (attribute, kind, options = {}) => {
-    if (options.message && isEmptyArray(attribute.value)) {
-        if ((attribute.kind === 'boolean' || attribute.kind === 'int64') && kind === 'int') {
-            return '0';
-        }
-        if (['SymInt', 'SymInt?', 'Scalar'].includes(attribute.kind) && kind === 'string') {
-            return '0';
-        }
-        if ((attribute.kind === 'Tensor?' || attribute.kind === 'int64?') && kind === 'null') {
-            return null;
-        }
-    }
     return normalizeAttributePayloadForOptions(kind, attribute.value, options);
 };
 
@@ -775,33 +706,7 @@ const normalizeAttributePayload = (kind, value) => {
 };
 
 const normalizeAttributePayloadForOptions = (kind, value, options = {}) => {
-    const payload = normalizeAttributePayload(kind, value);
-    return options.message ? normalizeUnsafeIntegerPayload(payload) : payload;
-};
-
-const normalizeUnsafeIntegerPayload = (value) => {
-    if (Array.isArray(value)) {
-        return value.map(normalizeUnsafeIntegerPayload);
-    }
-    if (typeof value === 'string' && /^-?\d+$/.test(value)) {
-        const number = Number(value);
-        if (Number.isFinite(number) && Math.abs(number) > Number.MAX_SAFE_INTEGER) {
-            return String(number);
-        }
-    }
-    return value;
-};
-
-const isEmptyArray = (value) => Array.isArray(value) && value.length === 0;
-
-const isIntegerLike = (value) => {
-    if (Number.isInteger(value)) {
-        return true;
-    }
-    if (typeof value === 'bigint') {
-        return true;
-    }
-    return typeof value === 'string' && /^-?\d+$/.test(value);
+    return normalizeAttributePayload(kind, value);
 };
 
 const scalarText = (value) => {

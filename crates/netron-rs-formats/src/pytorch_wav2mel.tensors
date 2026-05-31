@@ -1,2 +1,0 @@
-log_melspectrogram.melspectrogram.spectrogram.window|float32|400|1600
-log_melspectrogram.melspectrogram.mel_scale.fb|float32|201,40|32160

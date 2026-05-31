@@ -1,5 +1,0 @@
-tanh|code/__torch__/___torch_mangle_8.py:15:15|/python/site-packages/torch\nn\modules\activation.py:295:0|%input.1|%3|
-sigmoid|code/__torch__/___torch_mangle_8.py:15:34|/python/site-packages/torch\nn\modules\activation.py:271:0|%input.1|%5|
-relu|code/__torch__/___torch_mangle_8.py:15:56|/python/site-packages/torch\nn\functional.py:914:0|%input.1|%7|
-leaky_relu|code/__torch__/___torch_mangle_8.py:15:75|/python/site-packages/torch\nn\functional.py:1063:0|%input.1|%10|
-TupleConstruct|||%3,%5,%7,%10|%11|

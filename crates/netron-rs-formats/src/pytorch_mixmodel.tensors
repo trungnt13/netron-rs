@@ -1,4 +1,0 @@
-common_linear.weight|float32|113,1296|585792
-common_linear.bias|float32|113|452
-wdl_linear.weight|float32|3,32|384
-wdl_linear.bias|float32|3|12

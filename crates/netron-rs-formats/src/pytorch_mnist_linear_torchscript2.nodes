@@ -1,7 +1,0 @@
-t|code/__torch__.py:18:38|/python/site-packages/torch/nn/functional.py:1372:0|fc1.weight|%16
-matmul|code/__torch__.py:18:18|/python/site-packages/torch/nn/functional.py:1372:0|%input.1,%16|%output.1
-add_|code/__torch__.py:19:18|/python/site-packages/torch/nn/functional.py:1374:0|%output.1,fc1.bias|%input0.1
-relu|code/__torch__.py:20:18|/python/site-packages/torch/nn/functional.py:914:0|%input0.1|%input1.1
-t|code/__torch__.py:21:40|/python/site-packages/torch/nn/functional.py:1372:0|fc2.weight|%26
-matmul|code/__torch__.py:21:19|/python/site-packages/torch/nn/functional.py:1372:0|%input1.1,%26|%output0.1
-add_|code/__torch__.py:22:16|/python/site-packages/torch/nn/functional.py:1374:0|%output0.1,fc2.bias|%30

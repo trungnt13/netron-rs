@@ -107,114 +107,20 @@ fn layout_reports_format_independent_view_graph() {
 }
 
 #[test]
-fn parse_accepts_coreml_package_directory() {
-    let package = std::env::temp_dir().join("netron-rs-coreml-package.mlpackage");
-    let _ = fs::remove_dir_all(&package);
-    fs::create_dir_all(package.join("Data/com.apple.CoreML")).unwrap();
-    fs::write(
-        package.join("Manifest.json"),
-        r#"{
-            "itemInfoEntries": {
-                "aux": { "path": "com.apple.CoreML/aux.mlmodel" },
-                "model": { "path": "com.apple.CoreML/model.mlmodel" }
-            },
-            "rootModelIdentifier": "model"
-        }"#,
-    )
-    .unwrap();
-    fs::write(
-        package.join("Data/com.apple.CoreML/model.mlmodel"),
-        coreml_feature_vectorizer_model(),
-    )
-    .unwrap();
-    fs::write(
-        package.join("Data/com.apple.CoreML/aux.mlmodel"),
-        b"not a model",
-    )
-    .unwrap();
+fn parse_rejects_directory_input() {
+    let root = temp_root("netron-rs-directory");
+    fs::create_dir_all(&root).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
         .arg("parse")
-        .arg(&package)
+        .arg(&root)
         .output()
         .expect("run parse");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let model: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(model["format"]["name"], "Core ML");
-    assert_eq!(model["format"]["version"], "1");
-    assert_eq!(model["graphs"][0]["description"], "Feature Vectorizer");
-    assert_eq!(
-        model["graphs"][0]["nodes"][0]["operator"]["name"],
-        "featureVectorizer"
-    );
-}
-
-#[test]
-fn parse_rejects_coreml_package_manifest_escape() {
-    let root = temp_root("netron-rs-coreml-escape");
-    let package = root.join("model.mlpackage");
-    let outside_model = root.join("outside.mlmodel");
-    fs::create_dir_all(package.join("Data/com.apple.CoreML")).unwrap();
-    fs::write(&outside_model, coreml_feature_vectorizer_model()).unwrap();
-    fs::write(
-        package.join("Manifest.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "itemInfoEntries": {
-                "model": { "path": outside_model }
-            },
-            "rootModelIdentifier": "model"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
-        .arg("parse")
-        .arg(&package)
-        .output()
-        .expect("run parse");
-
     fs::remove_dir_all(&root).unwrap();
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("escapes package Data directory"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn parse_ignores_coreml_package_symlink_fallback() {
-    let root = temp_root("netron-rs-coreml-symlink");
-    let package = root.join("model.mlpackage");
-    let outside = root.join("outside");
-    fs::create_dir_all(&package).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-    fs::write(
-        outside.join("external.mlmodel"),
-        coreml_feature_vectorizer_model(),
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(&outside, package.join("linked")).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
-        .arg("parse")
-        .arg(&package)
-        .output()
-        .expect("run parse");
-
-    fs::remove_dir_all(&root).unwrap();
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("contains no .mlmodel file"),
+        String::from_utf8_lossy(&output.stderr).contains("unsupported model directory"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -243,24 +149,6 @@ fn fixture_model() -> Vec<u8> {
     message(&mut model, 7, fixture_graph());
     message(&mut model, 8, opset("", 18));
     model
-}
-
-fn coreml_feature_vectorizer_model() -> Vec<u8> {
-    let mut description = Vec::new();
-    message(&mut description, 1, coreml_feature("x"));
-    message(&mut description, 10, coreml_feature("y"));
-
-    let mut model = Vec::new();
-    varint(&mut model, 1, 1);
-    message(&mut model, 2, description);
-    message(&mut model, 602, Vec::new());
-    model
-}
-
-fn coreml_feature(name: &str) -> Vec<u8> {
-    let mut feature = Vec::new();
-    string(&mut feature, 1, name);
-    feature
 }
 
 fn fixture_graph() -> Vec<u8> {

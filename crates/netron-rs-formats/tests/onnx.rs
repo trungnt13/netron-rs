@@ -99,6 +99,79 @@ fn parses_single_file_zip_wrapper_around_onnx_model() {
 }
 
 #[test]
+fn rejects_unknown_extension_as_unsupported() {
+    let error = parse(ModelInput {
+        data: b"not a model",
+        path: Some(std::path::Path::new("model.txt")),
+    })
+    .expect_err("plain text should be unsupported");
+
+    assert!(matches!(
+        error,
+        netron_rs_core::ModelError::UnsupportedFormat
+    ));
+}
+
+#[test]
+fn rejects_mislabelled_onnx_file_as_unsupported() {
+    let error = parse(ModelInput {
+        data: b"this looks like text, not ONNX",
+        path: Some(std::path::Path::new("model.onnx")),
+    })
+    .expect_err("bad .onnx payload should be unsupported");
+
+    assert!(matches!(
+        error,
+        netron_rs_core::ModelError::UnsupportedFormat
+    ));
+}
+
+#[test]
+fn rejects_random_zip_payload_as_unsupported() {
+    let archive = zip_store("readme.txt", b"hello archive");
+    let error = parse(ModelInput {
+        data: &archive,
+        path: Some(std::path::Path::new("model.onnx.zip")),
+    })
+    .expect_err("unsupported zip payload should be unsupported");
+    assert!(matches!(
+        error,
+        netron_rs_core::ModelError::UnsupportedFormat
+    ));
+}
+
+#[test]
+fn rejects_generic_zip_wrapper_even_when_it_contains_onnx() {
+    let archive = zip_store("model.onnx", &fixture_model());
+    let error = parse(ModelInput {
+        data: &archive,
+        path: Some(std::path::Path::new("bundle.zip")),
+    })
+    .expect_err("generic zip wrapper should not probe ONNX contents");
+    assert!(matches!(
+        error,
+        netron_rs_core::ModelError::UnsupportedFormat
+    ));
+}
+
+#[test]
+fn rejects_nested_non_matching_archive_entries_as_unsupported() {
+    let archive = zip_store_entries(&[
+        ("assets/readme.txt", b"unused payload"),
+        ("notes/keep.txt", b"not a model"),
+    ]);
+    let error = parse(ModelInput {
+        data: &archive,
+        path: Some(std::path::Path::new("bundle.onnx.zip")),
+    })
+    .expect_err("only nested non-matching entries should be unsupported");
+    assert!(matches!(
+        error,
+        netron_rs_core::ModelError::UnsupportedFormat
+    ));
+}
+
+#[test]
 fn parses_zip_wrapper_around_onnx_json_model() {
     let data = br#"{
         "irVersion": "9",
