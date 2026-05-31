@@ -5,8 +5,9 @@ use std::{
 };
 
 use netron_rs_core::{
-    Attribute, AttributeValue, Dimension, DimensionValue, Function, Model, ModelError, ModelInput,
-    Operator, Tensor, TensorElementType, TensorStorage, TypeInfo,
+    Attribute, AttributeValue, Dimension, DimensionValue, Function, FunctionNode, FunctionValue,
+    Model, ModelError, ModelInput, Node, Operator, Tensor, TensorElementType, TensorStorage,
+    TypeInfo, Value,
 };
 use serde::Serialize;
 
@@ -323,6 +324,20 @@ pub struct MlirBlockSummary {
     pub operation_count: usize,
     pub value_count: usize,
     pub block_argument_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MlirAttributeDetail {
+    scope: String,
+    name: String,
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MlirResourceDetail {
+    scope: String,
+    name: String,
+    kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -654,6 +669,9 @@ impl OnnxIndex {
 pub struct MlirIndex {
     entries: Vec<SearchEntry>,
     summary: MlirSummary,
+    symbols: Vec<String>,
+    attributes: Vec<MlirAttributeDetail>,
+    resources: Vec<MlirResourceDetail>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -665,9 +683,12 @@ impl MlirIndex {
         let mut regions = Vec::new();
         let mut blocks = Vec::new();
         let mut dialects = BTreeSet::new();
-        let mut symbols = BTreeSet::new();
+        let mut symbol_set = BTreeSet::new();
+        let mut symbols = Vec::new();
         let mut attribute_count = 0;
         let mut resource_count = 0;
+        let mut attributes = Vec::new();
+        let mut resources = Vec::new();
 
         for (key, value) in &model.metadata.properties {
             entries.push(mlir_attribute_entry(
@@ -676,6 +697,11 @@ impl MlirIndex {
                 key,
                 [value.clone()],
             ));
+            attributes.push(MlirAttributeDetail {
+                scope: "model".to_owned(),
+                name: key.to_owned(),
+                values: vec![value.clone()],
+            });
             attribute_count += 1;
         }
 
@@ -721,18 +747,33 @@ impl MlirIndex {
                 terms,
             ));
             if let Some(name) = graph.name {
-                insert_mlir_symbol(&mut entries, &mut symbols, &scope, model.strings.get(name));
+                insert_mlir_symbol(
+                    &mut entries,
+                    &mut symbol_set,
+                    &mut symbols,
+                    &scope,
+                    model.strings.get(name),
+                );
             }
-            index_metadata_attributes(&mut entries, &mut attribute_count, &scope, &graph.metadata);
+            index_metadata_attributes(
+                &mut entries,
+                &mut attributes,
+                &mut attribute_count,
+                &scope,
+                &graph.metadata,
+            );
 
             for node in &graph.nodes {
                 index_mlir_operation(
                     model,
                     &mut entries,
                     &mut dialects,
+                    &mut symbol_set,
                     &mut symbols,
+                    &mut attributes,
                     &mut attribute_count,
                     &mut resource_count,
+                    &mut resources,
                     &scope,
                     node.id.index(),
                     None,
@@ -822,9 +863,10 @@ impl MlirIndex {
                 Some("MLIR"),
                 terms,
             ));
-            insert_mlir_symbol(&mut entries, &mut symbols, &scope, &name);
+            insert_mlir_symbol(&mut entries, &mut symbol_set, &mut symbols, &scope, &name);
             index_metadata_attributes(
                 &mut entries,
+                &mut attributes,
                 &mut attribute_count,
                 &scope,
                 &function.metadata,
@@ -859,9 +901,12 @@ impl MlirIndex {
                     model,
                     &mut entries,
                     &mut dialects,
+                    &mut symbol_set,
                     &mut symbols,
+                    &mut attributes,
                     &mut attribute_count,
                     &mut resource_count,
+                    &mut resources,
                     &scope,
                     operation_index,
                     Some(function_index),
@@ -878,8 +923,10 @@ impl MlirIndex {
             index_mlir_source_terms(
                 &mut entries,
                 &mut blocks,
+                &mut attributes,
                 &mut attribute_count,
                 &mut resource_count,
+                &mut resources,
                 source_text,
             );
         }
@@ -914,7 +961,7 @@ impl MlirIndex {
             block_argument_count,
             region_count: regions.len(),
             block_count: blocks.len(),
-            symbol_count: symbols.len(),
+            symbol_count: symbol_set.len(),
             dialect_count: dialects.len(),
             attribute_count,
             resource_count,
@@ -929,12 +976,24 @@ impl MlirIndex {
         Self {
             entries,
             summary,
+            symbols,
+            attributes,
+            resources,
             diagnostics: Vec::new(),
         }
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchEntry> {
         search_index_entries(&self.entries, query, limit)
+    }
+
+    pub fn detail(
+        &self,
+        model: &Model,
+        handle: &EntityHandle,
+        limit: usize,
+    ) -> Option<EntityDetail> {
+        mlir_detail(model, self, handle, limit)
     }
 }
 
@@ -996,6 +1055,7 @@ fn push_mlir_region_block_summaries(
 
 fn index_metadata_attributes(
     entries: &mut Vec<SearchEntry>,
+    attribute_details: &mut Vec<MlirAttributeDetail>,
     attribute_count: &mut usize,
     scope: &str,
     metadata: &BTreeMap<String, String>,
@@ -1007,6 +1067,11 @@ fn index_metadata_attributes(
             key,
             [value.clone()],
         ));
+        attribute_details.push(MlirAttributeDetail {
+            scope: scope.to_owned(),
+            name: key.to_owned(),
+            values: vec![value.clone()],
+        });
         *attribute_count += 1;
     }
 }
@@ -1017,8 +1082,11 @@ fn index_mlir_operation(
     entries: &mut Vec<SearchEntry>,
     dialects: &mut BTreeSet<String>,
     symbols: &mut BTreeSet<String>,
+    symbol_names: &mut Vec<String>,
+    attribute_details: &mut Vec<MlirAttributeDetail>,
     attribute_count: &mut usize,
     resource_count: &mut usize,
+    resource_details: &mut Vec<MlirResourceDetail>,
     scope: &str,
     operation_index: usize,
     function: Option<usize>,
@@ -1064,9 +1132,14 @@ fn index_mlir_operation(
             &name,
             value_terms.clone(),
         ));
+        attribute_details.push(MlirAttributeDetail {
+            scope: scope.to_owned(),
+            name: name.to_owned(),
+            values: value_terms.clone(),
+        });
         *attribute_count += 1;
         for symbol in mlir_symbol_terms(&name, &value_terms) {
-            insert_mlir_symbol(entries, symbols, scope, &symbol);
+            insert_mlir_symbol(entries, symbols, symbol_names, scope, &symbol);
         }
         if name == "rodata" {
             for value in value_terms {
@@ -1082,6 +1155,11 @@ fn index_mlir_operation(
                     Some("MLIR"),
                     [scope.to_owned(), "rodata".to_owned()],
                 ));
+                resource_details.push(MlirResourceDetail {
+                    scope: scope.to_owned(),
+                    name: value.clone(),
+                    kind: "rodata".to_owned(),
+                });
                 *resource_count += 1;
             }
         }
@@ -1147,6 +1225,7 @@ fn mlir_attribute_entry<I: IntoIterator<Item = String>>(
 fn insert_mlir_symbol(
     entries: &mut Vec<SearchEntry>,
     symbols: &mut BTreeSet<String>,
+    symbol_names: &mut Vec<String>,
     scope: &str,
     symbol: &str,
 ) {
@@ -1154,7 +1233,8 @@ fn insert_mlir_symbol(
     if symbol.is_empty() || !symbols.insert(symbol.to_owned()) {
         return;
     }
-    let id = symbols.len() - 1;
+    let id = symbol_names.len();
+    symbol_names.push(symbol.to_owned());
     entries.push(SearchEntry::new_with_handle_and_search_terms(
         SearchKind::Symbol,
         EntityHandle::MlirSymbol { symbol: id },
@@ -1170,8 +1250,10 @@ fn insert_mlir_symbol(
 fn index_mlir_source_terms(
     entries: &mut Vec<SearchEntry>,
     blocks: &mut Vec<MlirBlockSummary>,
+    attribute_details: &mut Vec<MlirAttributeDetail>,
     attribute_count: &mut usize,
     resource_count: &mut usize,
+    resource_details: &mut Vec<MlirResourceDetail>,
     source_text: &str,
 ) {
     for label in mlir_source_block_labels(source_text) {
@@ -1208,8 +1290,13 @@ fn index_mlir_source_terms(
             "source",
             *attribute_count,
             "type",
-            [type_text],
+            [type_text.clone()],
         ));
+        attribute_details.push(MlirAttributeDetail {
+            scope: "source".to_owned(),
+            name: "type".to_owned(),
+            values: vec![type_text.clone()],
+        });
         *attribute_count += 1;
     }
     for resource in mlir_source_dense_resources(source_text) {
@@ -1220,11 +1307,16 @@ fn index_mlir_source_terms(
             },
             None,
             *resource_count,
-            Some(resource),
+            Some(resource.clone()),
             None,
             Some("MLIR"),
             ["dense_resource".to_owned()],
         ));
+        resource_details.push(MlirResourceDetail {
+            scope: "source".to_owned(),
+            name: resource,
+            kind: "dense_resource".to_owned(),
+        });
         *resource_count += 1;
     }
 }
@@ -1845,7 +1937,9 @@ fn onnx_detail(
         EntityHandle::OperatorSet { domain, version } => {
             opset_detail(model, domain.as_deref(), *version)
         }
-        EntityHandle::Diagnostic { diagnostic } => diagnostic_detail(index, *diagnostic),
+        EntityHandle::Diagnostic { diagnostic } => {
+            diagnostic_detail(&index.diagnostics, *diagnostic)
+        }
         EntityHandle::MlirModule { .. }
         | EntityHandle::MlirFunction { .. }
         | EntityHandle::MlirOperation { .. }
@@ -1857,6 +1951,714 @@ fn onnx_detail(
         | EntityHandle::MlirAttribute { .. }
         | EntityHandle::MlirResource { .. } => None,
     }
+}
+
+fn mlir_detail(
+    model: &Model,
+    index: &MlirIndex,
+    handle: &EntityHandle,
+    limit: usize,
+) -> Option<EntityDetail> {
+    match handle {
+        EntityHandle::MlirModule { module } => mlir_module_detail(model, *module, limit),
+        EntityHandle::MlirFunction { function } => mlir_function_detail(model, *function, limit),
+        EntityHandle::MlirOperation { scope, operation } => {
+            mlir_operation_detail(model, scope, *operation, limit)
+        }
+        EntityHandle::MlirValue { scope, value } => mlir_value_detail(model, scope, *value, limit),
+        EntityHandle::MlirRegion { scope, region } => {
+            mlir_region_detail(index, scope, *region, limit)
+        }
+        EntityHandle::MlirBlock { scope, block } => mlir_block_detail(index, scope, *block, limit),
+        EntityHandle::MlirSymbol { symbol } => mlir_symbol_detail(index, *symbol),
+        EntityHandle::MlirDialect { dialect } => mlir_dialect_detail(model, index, dialect, limit),
+        EntityHandle::MlirAttribute { scope, attribute } => {
+            mlir_attribute_detail(index, scope, *attribute)
+        }
+        EntityHandle::MlirResource { resource } => mlir_resource_detail(index, *resource),
+        EntityHandle::Diagnostic { diagnostic } => {
+            diagnostic_detail(&index.diagnostics, *diagnostic)
+        }
+        EntityHandle::Graph { .. }
+        | EntityHandle::Node { .. }
+        | EntityHandle::Value { .. }
+        | EntityHandle::Tensor { .. }
+        | EntityHandle::Function { .. }
+        | EntityHandle::Metadata { .. }
+        | EntityHandle::OperatorSet { .. } => None,
+    }
+}
+
+fn mlir_module_detail(model: &Model, module_index: usize, limit: usize) -> Option<EntityDetail> {
+    let graph = model.graphs.get(module_index)?;
+    let scope = mlir_module_scope(module_index);
+    let mut fields = mlir_scope_fields(
+        graph.nodes.len(),
+        graph.values.len(),
+        0,
+        graph.metadata.len(),
+    );
+    fields.insert("scope".to_owned(), scope.clone());
+    if let Some(name) = graph.name {
+        fields.insert("name".to_owned(), model.strings.get(name).to_owned());
+    }
+    add_metadata_fields(&mut fields, &graph.metadata);
+
+    let mut related = Vec::new();
+    push_related(
+        &mut related,
+        limit,
+        EntityHandle::MlirRegion {
+            scope: scope.clone(),
+            region: 0,
+        },
+    );
+    push_related(
+        &mut related,
+        limit,
+        EntityHandle::MlirBlock {
+            scope: scope.clone(),
+            block: 0,
+        },
+    );
+    for node in &graph.nodes {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirOperation {
+                scope: scope.clone(),
+                operation: node.id.index(),
+            },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirModule {
+            module: module_index,
+        },
+        title: graph
+            .name
+            .map(|id| model.strings.get(id).to_owned())
+            .unwrap_or_else(|| format!("module {module_index}")),
+        fields,
+        related,
+    })
+}
+
+fn mlir_function_detail(
+    model: &Model,
+    function_index: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let function = model.functions.get(function_index)?;
+    let scope = mlir_function_scope(function_index);
+    let mut fields = mlir_scope_fields(
+        function.nodes.len(),
+        function.values.len(),
+        mlir_function_block_argument_count(model, function),
+        function.metadata.len() + function.attributes.len(),
+    );
+    fields.insert("scope".to_owned(), scope.clone());
+    fields.insert(
+        "name".to_owned(),
+        model.strings.get(function.name).to_owned(),
+    );
+    fields.insert("input_count".to_owned(), function.inputs.len().to_string());
+    fields.insert(
+        "output_count".to_owned(),
+        function.outputs.len().to_string(),
+    );
+    if let Some(domain) = function.domain {
+        fields.insert("domain".to_owned(), model.strings.get(domain).to_owned());
+    }
+    add_metadata_fields(&mut fields, &function.metadata);
+
+    let mut related = Vec::new();
+    push_related(
+        &mut related,
+        limit,
+        EntityHandle::MlirRegion {
+            scope: scope.clone(),
+            region: 0,
+        },
+    );
+    push_related(
+        &mut related,
+        limit,
+        EntityHandle::MlirBlock {
+            scope: scope.clone(),
+            block: 0,
+        },
+    );
+    for (operation, _) in function.nodes.iter().enumerate() {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirOperation {
+                scope: scope.clone(),
+                operation,
+            },
+        );
+    }
+    for (value, _) in function.values.iter().enumerate() {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirValue {
+                scope: scope.clone(),
+                value,
+            },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirFunction {
+            function: function_index,
+        },
+        title: model.strings.get(function.name).to_owned(),
+        fields,
+        related,
+    })
+}
+
+fn mlir_operation_detail(
+    model: &Model,
+    scope: &str,
+    operation_index: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    if let Some(module) = mlir_scope_index(scope, "module:") {
+        let graph = model.graphs.get(module)?;
+        let node = graph.nodes.get(operation_index)?;
+        return Some(mlir_graph_operation_detail(
+            model,
+            scope,
+            operation_index,
+            node,
+            limit,
+        ));
+    }
+    let function_index = mlir_scope_index(scope, "function:")?;
+    let function = model.functions.get(function_index)?;
+    let node = function.nodes.get(operation_index)?;
+    Some(mlir_function_operation_detail(
+        model,
+        scope,
+        operation_index,
+        function,
+        node,
+        limit,
+    ))
+}
+
+fn mlir_graph_operation_detail(
+    model: &Model,
+    scope: &str,
+    operation_index: usize,
+    node: &Node,
+    limit: usize,
+) -> EntityDetail {
+    let mut fields = mlir_operation_fields(
+        model,
+        &node.operator,
+        &node.metadata,
+        node.attributes.len(),
+        node.inputs.iter().flatten().count(),
+        node.outputs.iter().flatten().count(),
+    );
+    if let Some(name) = node.name {
+        fields.insert("name".to_owned(), model.strings.get(name).to_owned());
+    }
+    let mut related = Vec::new();
+    for value in node.inputs.iter().chain(&node.outputs).flatten() {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirValue {
+                scope: scope.to_owned(),
+                value: value.index(),
+            },
+        );
+    }
+    EntityDetail {
+        handle: EntityHandle::MlirOperation {
+            scope: scope.to_owned(),
+            operation: operation_index,
+        },
+        title: mlir_node_title(model, node.name, &node.operator),
+        fields,
+        related,
+    }
+}
+
+fn mlir_function_operation_detail(
+    model: &Model,
+    scope: &str,
+    operation_index: usize,
+    function: &Function,
+    node: &FunctionNode,
+    limit: usize,
+) -> EntityDetail {
+    let mut fields = mlir_operation_fields(
+        model,
+        &node.operator,
+        &node.metadata,
+        node.attributes.len(),
+        node.inputs.iter().flatten().count(),
+        node.outputs.iter().flatten().count(),
+    );
+    if let Some(name) = node.name {
+        fields.insert("name".to_owned(), model.strings.get(name).to_owned());
+    }
+    let mut related = Vec::new();
+    for value in node.inputs.iter().chain(&node.outputs).flatten() {
+        if let Some(value) = mlir_function_value_index(function, *value) {
+            push_related(
+                &mut related,
+                limit,
+                EntityHandle::MlirValue {
+                    scope: scope.to_owned(),
+                    value,
+                },
+            );
+        }
+    }
+    EntityDetail {
+        handle: EntityHandle::MlirOperation {
+            scope: scope.to_owned(),
+            operation: operation_index,
+        },
+        title: mlir_node_title(model, node.name, &node.operator),
+        fields,
+        related,
+    }
+}
+
+fn mlir_value_detail(
+    model: &Model,
+    scope: &str,
+    value_index: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    if let Some(module) = mlir_scope_index(scope, "module:") {
+        let graph = model.graphs.get(module)?;
+        let value = graph.values.get(value_index)?;
+        return Some(mlir_graph_value_detail(
+            model,
+            scope,
+            value_index,
+            value,
+            limit,
+        ));
+    }
+    let function_index = mlir_scope_index(scope, "function:")?;
+    let function = model.functions.get(function_index)?;
+    let value = function.values.get(value_index)?;
+    Some(mlir_function_value_detail(
+        model,
+        scope,
+        value_index,
+        function,
+        value,
+        limit,
+    ))
+}
+
+fn mlir_graph_value_detail(
+    model: &Model,
+    scope: &str,
+    value_index: usize,
+    value: &Value,
+    limit: usize,
+) -> EntityDetail {
+    let mut fields = mlir_value_fields(model, model.strings.get(value.name), &value.type_info);
+    fields.insert(
+        "consumer_count".to_owned(),
+        value.consumers.len().to_string(),
+    );
+    fields.insert(
+        "is_graph_input".to_owned(),
+        value.is_graph_input.to_string(),
+    );
+    fields.insert(
+        "is_graph_output".to_owned(),
+        value.is_graph_output.to_string(),
+    );
+    add_metadata_fields(&mut fields, &value.metadata);
+    let mut related = Vec::new();
+    if let Some(producer) = value.producer {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirOperation {
+                scope: scope.to_owned(),
+                operation: producer.index(),
+            },
+        );
+    }
+    for consumer in &value.consumers {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::MlirOperation {
+                scope: scope.to_owned(),
+                operation: consumer.index(),
+            },
+        );
+    }
+    if let Some(tensor) = value.initializer {
+        fields.insert("initializer".to_owned(), tensor.index().to_string());
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Tensor {
+                tensor: tensor.index(),
+            },
+        );
+    }
+    EntityDetail {
+        handle: EntityHandle::MlirValue {
+            scope: scope.to_owned(),
+            value: value_index,
+        },
+        title: model.strings.get(value.name).to_owned(),
+        fields,
+        related,
+    }
+}
+
+fn mlir_function_value_detail(
+    model: &Model,
+    scope: &str,
+    value_index: usize,
+    function: &Function,
+    value: &FunctionValue,
+    limit: usize,
+) -> EntityDetail {
+    let name = model.strings.get(value.name);
+    let mut fields = mlir_value_fields(model, name, &value.type_info);
+    fields.insert(
+        "is_block_argument".to_owned(),
+        mlir_function_block_argument_names(model, function)
+            .contains(name)
+            .to_string(),
+    );
+    let mut related = Vec::new();
+    for (operation, node) in function.nodes.iter().enumerate() {
+        if node
+            .inputs
+            .iter()
+            .chain(&node.outputs)
+            .flatten()
+            .any(|id| *id == value.name)
+        {
+            push_related(
+                &mut related,
+                limit,
+                EntityHandle::MlirOperation {
+                    scope: scope.to_owned(),
+                    operation,
+                },
+            );
+        }
+    }
+    if let Some(tensor) = value.initializer {
+        fields.insert("initializer".to_owned(), tensor.index().to_string());
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Tensor {
+                tensor: tensor.index(),
+            },
+        );
+    }
+    EntityDetail {
+        handle: EntityHandle::MlirValue {
+            scope: scope.to_owned(),
+            value: value_index,
+        },
+        title: name.to_owned(),
+        fields,
+        related,
+    }
+}
+
+fn mlir_region_detail(
+    index: &MlirIndex,
+    scope: &str,
+    region: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let handle = EntityHandle::MlirRegion {
+        scope: scope.to_owned(),
+        region,
+    };
+    let summary = index
+        .summary
+        .regions
+        .iter()
+        .find(|summary| summary.handle == handle)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("scope".to_owned(), summary.scope_id.clone());
+    fields.insert("region".to_owned(), region.to_string());
+    fields.insert("block_count".to_owned(), summary.block_count.to_string());
+    let mut related = Vec::new();
+    for block in index
+        .summary
+        .blocks
+        .iter()
+        .filter(|block| block.scope_id == summary.scope_id)
+    {
+        push_related(&mut related, limit, block.handle.clone());
+    }
+    Some(EntityDetail {
+        handle,
+        title: format!("{scope} region {region}"),
+        fields,
+        related,
+    })
+}
+
+fn mlir_block_detail(
+    index: &MlirIndex,
+    scope: &str,
+    block: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let handle = EntityHandle::MlirBlock {
+        scope: scope.to_owned(),
+        block,
+    };
+    let summary = index
+        .summary
+        .blocks
+        .iter()
+        .find(|summary| summary.handle == handle)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("scope".to_owned(), summary.scope_id.clone());
+    fields.insert("block".to_owned(), block.to_string());
+    fields.insert(
+        "operation_count".to_owned(),
+        summary.operation_count.to_string(),
+    );
+    fields.insert("value_count".to_owned(), summary.value_count.to_string());
+    fields.insert(
+        "block_argument_count".to_owned(),
+        summary.block_argument_count.to_string(),
+    );
+    let mut related = Vec::new();
+    for region in index
+        .summary
+        .regions
+        .iter()
+        .filter(|region| region.scope_id == summary.scope_id)
+    {
+        push_related(&mut related, limit, region.handle.clone());
+    }
+    Some(EntityDetail {
+        handle,
+        title: format!("{scope} block {block}"),
+        fields,
+        related,
+    })
+}
+
+fn mlir_symbol_detail(index: &MlirIndex, symbol: usize) -> Option<EntityDetail> {
+    let name = index.symbols.get(symbol)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_owned(), name.clone());
+    fields.insert("index".to_owned(), symbol.to_string());
+    fields.insert(
+        "symbol_count".to_owned(),
+        index.summary.symbol_count.to_string(),
+    );
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirSymbol { symbol },
+        title: name.clone(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn mlir_dialect_detail(
+    model: &Model,
+    index: &MlirIndex,
+    dialect: &str,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_owned(), dialect.to_owned());
+
+    let mut related = Vec::new();
+    let mut operation_count = 0usize;
+    for (module, graph) in model.graphs.iter().enumerate() {
+        let scope = mlir_module_scope(module);
+        for (operation, node) in graph.nodes.iter().enumerate() {
+            if mlir_dialect(model.strings.get(node.operator.name)) == dialect {
+                operation_count += 1;
+                push_related(
+                    &mut related,
+                    limit,
+                    EntityHandle::MlirOperation {
+                        scope: scope.clone(),
+                        operation,
+                    },
+                );
+            }
+        }
+    }
+    for (function_index, function) in model.functions.iter().enumerate() {
+        let scope = mlir_function_scope(function_index);
+        for (operation, node) in function.nodes.iter().enumerate() {
+            if mlir_dialect(model.strings.get(node.operator.name)) == dialect {
+                operation_count += 1;
+                push_related(
+                    &mut related,
+                    limit,
+                    EntityHandle::MlirOperation {
+                        scope: scope.clone(),
+                        operation,
+                    },
+                );
+            }
+        }
+    }
+    if operation_count == 0 && !index.summary.dialects.iter().any(|value| value == dialect) {
+        return None;
+    }
+    fields.insert("operation_count".to_owned(), operation_count.to_string());
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirDialect {
+            dialect: dialect.to_owned(),
+        },
+        title: dialect.to_owned(),
+        fields,
+        related,
+    })
+}
+
+fn mlir_attribute_detail(index: &MlirIndex, scope: &str, attribute: usize) -> Option<EntityDetail> {
+    let detail = index.attributes.get(attribute)?;
+    if detail.scope != scope {
+        return None;
+    }
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_owned(), detail.name.clone());
+    fields.insert("scope".to_owned(), detail.scope.clone());
+    fields.insert("index".to_owned(), attribute.to_string());
+    fields.insert("value_count".to_owned(), detail.values.len().to_string());
+    for (index, value) in detail.values.iter().enumerate() {
+        fields.insert(format!("value_{index}"), value.clone());
+    }
+
+    let mut related = Vec::new();
+    if let Some(module) = mlir_scope_index(&detail.scope, "module:") {
+        push_related(&mut related, 1, EntityHandle::MlirModule { module });
+    }
+    if let Some(function) = mlir_scope_index(&detail.scope, "function:") {
+        push_related(&mut related, 1, EntityHandle::MlirFunction { function });
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirAttribute {
+            scope: detail.scope.clone(),
+            attribute,
+        },
+        title: format!("{}::{}", detail.scope, detail.name),
+        fields,
+        related,
+    })
+}
+
+fn mlir_resource_detail(index: &MlirIndex, resource: usize) -> Option<EntityDetail> {
+    let detail = index.resources.get(resource)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_owned(), detail.name.clone());
+    fields.insert("kind".to_owned(), detail.kind.clone());
+    fields.insert("scope".to_owned(), detail.scope.clone());
+    fields.insert("index".to_owned(), resource.to_string());
+
+    Some(EntityDetail {
+        handle: EntityHandle::MlirResource { resource },
+        title: detail.name.clone(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn mlir_scope_fields(
+    operation_count: usize,
+    value_count: usize,
+    block_argument_count: usize,
+    attribute_count: usize,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("operation_count".to_owned(), operation_count.to_string()),
+        ("value_count".to_owned(), value_count.to_string()),
+        (
+            "block_argument_count".to_owned(),
+            block_argument_count.to_string(),
+        ),
+        ("attribute_count".to_owned(), attribute_count.to_string()),
+        ("region_count".to_owned(), "1".to_owned()),
+        ("block_count".to_owned(), "1".to_owned()),
+    ])
+}
+
+fn mlir_operation_fields(
+    model: &Model,
+    operator: &Operator,
+    metadata: &BTreeMap<String, String>,
+    attribute_count: usize,
+    input_count: usize,
+    output_count: usize,
+) -> BTreeMap<String, String> {
+    let operator_name = model.strings.get(operator.name).to_owned();
+    let mut fields = BTreeMap::new();
+    fields.insert("operator".to_owned(), operator_name.clone());
+    fields.insert("dialect".to_owned(), mlir_dialect(&operator_name));
+    fields.insert("origin".to_owned(), operator.origin.to_owned());
+    fields.insert("input_count".to_owned(), input_count.to_string());
+    fields.insert("output_count".to_owned(), output_count.to_string());
+    fields.insert("attribute_count".to_owned(), attribute_count.to_string());
+    add_metadata_fields(&mut fields, metadata);
+    fields
+}
+
+fn mlir_value_fields(
+    model: &Model,
+    name: &str,
+    type_info: &Option<TypeInfo>,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::from([("name".to_owned(), name.to_owned())]);
+    if let Some(type_info) = type_info {
+        add_type_fields(
+            model,
+            &mut fields,
+            type_info.element_type.as_ref(),
+            &type_info.shape,
+        );
+    }
+    fields
+}
+
+fn mlir_node_title(
+    model: &Model,
+    name: Option<netron_rs_core::StringId>,
+    operator: &Operator,
+) -> String {
+    name.map(|id| model.strings.get(id).to_owned())
+        .unwrap_or_else(|| model.strings.get(operator.name).to_owned())
+}
+
+fn mlir_function_value_index(function: &Function, name: netron_rs_core::StringId) -> Option<usize> {
+    function.values.iter().position(|value| value.name == name)
+}
+
+fn mlir_scope_index(scope: &str, prefix: &str) -> Option<usize> {
+    scope.strip_prefix(prefix)?.parse().ok()
 }
 
 fn graph_detail(model: &Model, graph_index: usize, limit: usize) -> Option<EntityDetail> {
@@ -2174,8 +2976,8 @@ fn opset_detail(model: &Model, domain: Option<&str>, version: i64) -> Option<Ent
     })
 }
 
-fn diagnostic_detail(index: &OnnxIndex, diagnostic_index: usize) -> Option<EntityDetail> {
-    let diagnostic = index.diagnostics.get(diagnostic_index)?;
+fn diagnostic_detail(diagnostics: &[Diagnostic], diagnostic_index: usize) -> Option<EntityDetail> {
+    let diagnostic = diagnostics.get(diagnostic_index)?;
     let handle = EntityHandle::Diagnostic {
         diagnostic: diagnostic_index,
     };
@@ -2472,7 +3274,8 @@ impl FormatIndex {
     ) -> Option<EntityDetail> {
         match self {
             Self::Onnx(index) => index.detail(model, handle, limit),
-            Self::Mlir(_) | Self::Unknown(_) => None,
+            Self::Mlir(index) => index.detail(model, handle, limit),
+            Self::Unknown(_) => None,
         }
     }
 }
@@ -3051,6 +3854,262 @@ mod tests {
             location_hits
                 .iter()
                 .any(|hit| matches!(hit.handle, EntityHandle::MlirOperation { .. }))
+        );
+    }
+
+    #[test]
+    fn mlir_detail_returns_scoped_entity_metadata_and_relations() {
+        let data = br#"module @jit_mlp attributes {mhlo.num_partitions = 1 : i32} {
+  func.func @loop(%i: index) {
+    %c = stablehlo.constant dense<1.0> : tensor<1xf32>
+    %0 = arith.index_cast %i : index to i64 loc("kernel.mlir")
+    %1 = vm.const.ref.rodata @blob : !vm.buffer
+    return %0 : i64
+  }
+}
+"#;
+        let session = ModelSession::open(
+            data,
+            ModelSource::from_memory(Some("detail.mlir".to_owned()), data.len()),
+        )
+        .expect("open MLIR session");
+        let summary = session.summary(&SessionLimits::default());
+        let mlir = summary.mlir.expect("mlir summary");
+
+        let module_detail = session
+            .detail(
+                &EntityHandle::MlirModule { module: 0 },
+                &SessionLimits::default(),
+            )
+            .expect("module detail");
+        assert_eq!(module_detail.title, "@jit_mlp");
+        assert_eq!(
+            module_detail.fields.get("scope").map(String::as_str),
+            Some("module:0")
+        );
+        assert!(
+            module_detail
+                .related
+                .iter()
+                .any(|handle| matches!(handle, EntityHandle::MlirRegion { .. }))
+        );
+
+        let function_handle = session
+            .search("loop", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                (matches!(hit.handle, EntityHandle::MlirFunction { .. })).then_some(hit.handle)
+            })
+            .expect("function hit");
+        let function_detail = session
+            .detail(&function_handle, &SessionLimits::default())
+            .expect("function detail");
+        assert_eq!(function_detail.title, "@jit_mlp::@loop");
+        assert_eq!(
+            function_detail.fields.get("scope").map(String::as_str),
+            Some("function:0")
+        );
+        assert!(
+            function_detail
+                .related
+                .iter()
+                .any(|handle| matches!(handle, EntityHandle::MlirValue { .. }))
+        );
+
+        let operation_handle = session
+            .search("stablehlo.constant", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirOperation { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("operation hit");
+        let operation_detail = session
+            .detail(&operation_handle, &SessionLimits::default())
+            .expect("operation detail");
+        assert_eq!(
+            operation_detail.fields.get("operator").map(String::as_str),
+            Some("stablehlo.constant")
+        );
+        assert!(operation_detail.fields.get("origin").is_some());
+        assert!(
+            operation_detail
+                .related
+                .iter()
+                .any(|handle| matches!(handle, EntityHandle::MlirValue { .. }))
+        );
+
+        let value_handle = session
+            .search("%i", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirValue { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("value hit");
+        let value_detail = session
+            .detail(&value_handle, &SessionLimits::default())
+            .expect("value detail");
+        assert_eq!(value_detail.title, "%i");
+        assert_eq!(
+            value_detail.fields.get("name").map(String::as_str),
+            Some("%i")
+        );
+        assert!(value_detail.fields.get("is_block_argument").is_some());
+
+        let block_handle = match mlir.blocks.first() {
+            Some(block) => block.handle.clone(),
+            None => panic!("module should have a block"),
+        };
+        let block_detail = session
+            .detail(&block_handle, &SessionLimits::default())
+            .expect("block detail");
+        assert_eq!(
+            block_detail.handle, block_handle,
+            "block detail should preserve handle"
+        );
+        assert_eq!(
+            block_detail.fields.get("scope").map(String::as_str),
+            Some("module:0")
+        );
+
+        let region_handle = match mlir.regions.first() {
+            Some(region) => region.handle.clone(),
+            None => panic!("module should have a region"),
+        };
+        let region_detail = session
+            .detail(&region_handle, &SessionLimits::default())
+            .expect("region detail");
+        assert_eq!(region_detail.handle, region_handle);
+        assert!(
+            region_detail
+                .fields
+                .get("region")
+                .is_some_and(|value| value == "0")
+        );
+
+        let symbol_handle = session
+            .search("jit_mlp", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirSymbol { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("symbol hit");
+        let symbol_detail = session
+            .detail(&symbol_handle, &SessionLimits::default())
+            .expect("symbol detail");
+        assert_eq!(
+            symbol_detail.fields.get("name").map(String::as_str),
+            Some("jit_mlp")
+        );
+        assert_eq!(
+            symbol_detail
+                .fields
+                .get("symbol_count")
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(mlir.symbol_count)
+        );
+
+        let dialect_handle = session
+            .search("arith", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirDialect { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("dialect hit");
+        let dialect_detail = session
+            .detail(&dialect_handle, &SessionLimits::default())
+            .expect("dialect detail");
+        assert_eq!(
+            dialect_detail
+                .fields
+                .get("operation_count")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_default(),
+            1
+        );
+        assert!(
+            dialect_detail
+                .related
+                .iter()
+                .any(|handle| matches!(handle, EntityHandle::MlirOperation { .. }))
+        );
+
+        let attribute_handle = session
+            .search("mhlo.num_partitions", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirAttribute { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("attribute hit");
+        let attribute_detail = session
+            .detail(&attribute_handle, &SessionLimits::default())
+            .expect("attribute detail");
+        assert_eq!(
+            attribute_detail.fields.get("name").map(String::as_str),
+            Some("mhlo.num_partitions")
+        );
+        assert_eq!(
+            attribute_detail.fields.get("scope").map(String::as_str),
+            Some("module:0")
+        );
+        assert_eq!(
+            attribute_detail
+                .fields
+                .get("value_count")
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(1)
+        );
+        assert!(
+            attribute_detail
+                .related
+                .iter()
+                .any(|handle| matches!(handle, EntityHandle::MlirModule { module: 0 }))
+        );
+
+        let resource_handle = session
+            .search("blob", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                if let EntityHandle::MlirResource { .. } = hit.handle {
+                    Some(hit.handle)
+                } else {
+                    None
+                }
+            })
+            .expect("resource hit");
+        let resource_detail = session
+            .detail(&resource_handle, &SessionLimits::default())
+            .expect("resource detail");
+        assert_eq!(
+            resource_detail.fields.get("kind").map(String::as_str),
+            Some("rodata")
+        );
+        assert_eq!(
+            resource_detail.fields.get("name").map(String::as_str),
+            Some("blob")
+        );
+        assert_eq!(
+            resource_detail.fields.get("scope").map(String::as_str),
+            Some("function:0")
         );
     }
 

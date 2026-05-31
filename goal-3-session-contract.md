@@ -51,6 +51,10 @@ and future web/VS Code clients.
   - `{ "kind": "mlir_value", "scope": "function:0", "value": 7 }`
   - `{ "kind": "mlir_region", "scope": "function:0", "region": 0 }`
   - `{ "kind": "mlir_block", "scope": "function:0", "block": 0 }`
+  - `{ "kind": "mlir_symbol", "symbol": 0 }`
+  - `{ "kind": "mlir_dialect", "dialect": "arith" }`
+  - `{ "kind": "mlir_attribute", "scope": "function:0", "attribute": 2 }`
+  - `{ "kind": "mlir_resource", "resource": 0 }`
 
 ## Shared Limits
 
@@ -97,7 +101,8 @@ and future web/VS Code clients.
   - optional `byte_len`, `element_count`, `external_data`, sparse tensor links,
     and metadata
 - `EntityDetail`
-  - `handle`, `title`, bounded string `fields`, and bounded related handles
+  - `handle`, `title`, bounded string `fields`, and bounded related handles;
+    ONNX and MLIR details share this envelope
 
 ## Error Mapping
 
