@@ -1,6 +1,8 @@
-use netron_rs_core::{AttributeValue, TensorElementType, TensorStorage};
+use netron_rs_core::{AttributeValue, ModelError, TensorElementType, TensorStorage};
 use netron_rs_formats::{ModelInput, ToNormalizedJson, parse};
 use serde_json::json;
+#[cfg(unix)]
+use std::{fs, os::unix::fs::symlink, time::SystemTime};
 
 #[test]
 fn parses_onnx_graph_into_canonical_normalized_json() {
@@ -8,6 +10,7 @@ fn parses_onnx_graph_into_canonical_normalized_json() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("fixture parses");
 
@@ -90,6 +93,7 @@ fn parses_single_file_zip_wrapper_around_onnx_model() {
     let model = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("model.onnx.zip")),
+        allow_unsafe_paths: false,
     })
     .expect("zip-wrapped ONNX model parses");
 
@@ -103,6 +107,7 @@ fn rejects_unknown_extension_as_unsupported() {
     let error = parse(ModelInput {
         data: b"not a model",
         path: Some(std::path::Path::new("model.txt")),
+        allow_unsafe_paths: false,
     })
     .expect_err("plain text should be unsupported");
 
@@ -117,6 +122,7 @@ fn rejects_mislabelled_onnx_file_as_unsupported() {
     let error = parse(ModelInput {
         data: b"this looks like text, not ONNX",
         path: Some(std::path::Path::new("model.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect_err("bad .onnx payload should be unsupported");
 
@@ -132,6 +138,7 @@ fn rejects_random_zip_payload_as_unsupported() {
     let error = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("model.onnx.zip")),
+        allow_unsafe_paths: false,
     })
     .expect_err("unsupported zip payload should be unsupported");
     assert!(matches!(
@@ -141,11 +148,118 @@ fn rejects_random_zip_payload_as_unsupported() {
 }
 
 #[test]
+fn rejects_onnx_absolute_external_data_path() {
+    let location = std::env::temp_dir()
+        .join("netron-rs-denied.bin")
+        .to_string_lossy()
+        .into_owned();
+    let data = tensor_with_external_data("w", &[1], 1, &location);
+    let model_path = std::path::Path::new("model.onnx");
+    let error = parse(ModelInput {
+        data: &data,
+        path: Some(model_path),
+        allow_unsafe_paths: false,
+    })
+    .expect_err("absolute external-data paths must be denied");
+    assert!(matches!(error, ModelError::AccessDenied { .. }));
+    if let ModelError::AccessDenied { path } = error {
+        assert!(path.contains("model.onnx"));
+        assert!(path.contains(&location));
+    }
+}
+
+#[test]
+fn rejects_onnx_external_data_path_with_traversal() {
+    for location in ["../outside.bin", r"..\outside.bin"] {
+        let data = tensor_with_external_data("w", &[1], 1, location);
+        let data_path = std::path::Path::new("/tmp/model.onnx");
+        let error = parse(ModelInput {
+            data: &data,
+            path: Some(data_path),
+            allow_unsafe_paths: false,
+        })
+        .expect_err("path traversal in external-data location should be denied");
+        assert!(matches!(error, ModelError::AccessDenied { .. }));
+    }
+}
+
+#[test]
+fn rejects_onnx_external_data_uri_locations() {
+    for location in [
+        "http://example.com/t.bin",
+        "ftp://example.com/t.bin",
+        "file://host/share/t.bin",
+    ] {
+        let data = tensor_with_external_data("w", &[1], 1, location);
+        let data_path = std::path::Path::new("/tmp/model.onnx");
+        let error = parse(ModelInput {
+            data: &data,
+            path: Some(data_path),
+            allow_unsafe_paths: false,
+        })
+        .expect_err("uri external-data locations should be denied");
+        assert!(matches!(error, ModelError::AccessDenied { .. }));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_onnx_external_data_symlink_escape_when_canonicalized() {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("netron-onnx-{}", unique));
+    let model_dir = temp_root.join("model");
+    let link_dir = model_dir.join("links");
+    let target_dir = temp_root.join("external");
+    fs::create_dir_all(&link_dir).unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    let model_path = model_dir.join("model.onnx");
+    let target_file = target_dir.join("outside.bin");
+    fs::write(&target_file, b"").unwrap();
+    let link_file = link_dir.join("outside.bin");
+    symlink(&target_file, &link_file).unwrap();
+    let data = tensor_with_external_data("w", &[1], 1, "links/outside.bin");
+
+    let error = parse(ModelInput {
+        data: &data,
+        path: Some(model_path.as_path()),
+        allow_unsafe_paths: false,
+    })
+    .expect_err("symlink escape should be denied");
+
+    assert!(matches!(error, ModelError::AccessDenied { .. }));
+    fs::remove_dir_all(&temp_root).unwrap();
+}
+
+#[test]
+fn parses_onnx_external_data_with_allow_unsafe_flag() {
+    let location = std::env::temp_dir()
+        .join("netron-rs-trusted.bin")
+        .to_string_lossy()
+        .into_owned();
+    let data = tensor_with_external_data("w", &[1], 1, &location);
+    let model_path = std::path::Path::new("/tmp/model.onnx");
+    let model = parse(ModelInput {
+        data: &data,
+        path: Some(model_path),
+        allow_unsafe_paths: true,
+    })
+    .expect("unsafe paths should be allowed when explicitly enabled");
+    assert!(matches!(
+        model.tensors[0].storage,
+        TensorStorage::External { .. }
+    ));
+}
+
+#[test]
 fn rejects_generic_zip_wrapper_even_when_it_contains_onnx() {
     let archive = zip_store("model.onnx", &fixture_model());
     let error = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("bundle.zip")),
+        allow_unsafe_paths: false,
     })
     .expect_err("generic zip wrapper should not probe ONNX contents");
     assert!(matches!(
@@ -163,6 +277,7 @@ fn rejects_nested_non_matching_archive_entries_as_unsupported() {
     let error = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("bundle.onnx.zip")),
+        allow_unsafe_paths: false,
     })
     .expect_err("only nested non-matching entries should be unsupported");
     assert!(matches!(
@@ -218,6 +333,7 @@ fn parses_zip_wrapper_around_onnx_json_model() {
     let model = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("model.onnx.zip")),
+        allow_unsafe_paths: false,
     })
     .expect("zip-wrapped ONNX JSON model parses");
 
@@ -256,6 +372,7 @@ fn zip_wrapper_prefers_onnx_model_over_dot_sidecar() {
     let model = parse(ModelInput {
         data: &archive,
         path: Some(std::path::Path::new("model.onnx.zip")),
+        allow_unsafe_paths: false,
     })
     .expect("zip-wrapped ONNX model with DOT sidecar parses");
 
@@ -283,6 +400,7 @@ fn normalizes_torch_package_operator_overload_like_netron() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("torch-op.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("torch package op parses");
 
@@ -319,6 +437,7 @@ fn cast_output_type_overrides_stale_value_info() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("cast.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("cast fixture parses");
     let normalized: serde_json::Value =
@@ -367,6 +486,7 @@ fn concat_output_shape_uses_concrete_input_shapes() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("concat.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("concat fixture parses");
     let normalized: serde_json::Value =
@@ -422,6 +542,7 @@ fn concat_preserves_unknown_graph_output_dimension_markers() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("concat-none.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("concat none fixture parses");
     let normalized: serde_json::Value =
@@ -461,6 +582,7 @@ fn preserves_empty_input_names_metadata_and_exact_large_int_attributes() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("metadata.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("metadata fixture parses");
     let normalized: serde_json::Value =
@@ -502,6 +624,7 @@ fn value_info_does_not_override_graph_output_type() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("output-type.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("output type fixture parses");
     let normalized: serde_json::Value =
@@ -545,6 +668,7 @@ fn graph_output_leading_zero_dimension_is_unknown_like_netron() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("zero-output.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("zero output fixture parses");
     let normalized: serde_json::Value =
@@ -569,6 +693,7 @@ fn parses_null_graph_without_error() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("null graph model parses");
 
@@ -584,6 +709,7 @@ fn parses_standalone_graph_proto() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("graph.onnx")),
+        allow_unsafe_paths: false,
     })
     .expect("standalone graph parses");
 
@@ -614,6 +740,7 @@ fn parses_sparse_initializer_as_sparse_tensor_metadata() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("sparse fixture parses");
 
@@ -650,6 +777,7 @@ fn hides_initializer_outputs_like_netron() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("initializer output fixture parses");
 
@@ -673,6 +801,7 @@ fn preserves_optional_value_type_shell() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("optional type fixture parses");
 
@@ -709,6 +838,7 @@ fn normalizes_complex_type_names_like_netron() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("complex fixture parses");
 
@@ -759,6 +889,7 @@ fn preserves_unpacked_repeated_attribute_scalars() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("attribute fixture parses");
 
@@ -796,6 +927,7 @@ fn promotes_single_use_constant_tensor_to_initializer() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("constant fixture parses");
 
@@ -835,6 +967,7 @@ fn parses_local_function_signature_and_overload() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("function-only fixture parses");
 
@@ -869,6 +1002,7 @@ fn promotes_local_function_constant_tensor_to_initializer() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("function constant fixture parses");
 
@@ -908,6 +1042,7 @@ fn preserves_local_function_node_tensor_attributes() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("function reused constant fixture parses");
 
@@ -942,6 +1077,7 @@ fn moves_single_use_graph_initializer_into_local_function() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("function initializer fixture parses");
 
@@ -1012,6 +1148,7 @@ fn propagates_single_use_initializer_through_nested_local_functions() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("nested function initializer fixture parses");
 
@@ -1049,6 +1186,7 @@ fn duplicate_local_function_signature_keeps_last_definition() {
     let model = parse(ModelInput {
         data: &data,
         path: None,
+        allow_unsafe_paths: false,
     })
     .expect("duplicate function fixture parses");
 
@@ -1076,6 +1214,7 @@ fn parses_standalone_tensor_proto_as_constant_graph() {
     let model = parse(ModelInput {
         data: &data,
         path: Some(std::path::Path::new("zero_point.pb")),
+        allow_unsafe_paths: false,
     })
     .expect("standalone tensor fixture parses");
 
@@ -1380,6 +1519,15 @@ fn tensor(name: &str, dims: &[u64], data_type: u64, raw_data: &[u8]) -> Vec<u8> 
     varint(&mut tensor, 2, data_type);
     string(&mut tensor, 8, name);
     bytes(&mut tensor, 9, raw_data);
+    tensor
+}
+
+fn tensor_with_external_data(name: &str, dims: &[u64], data_type: u64, location: &str) -> Vec<u8> {
+    let mut tensor = tensor(name, dims, data_type, &[]);
+    let mut entry = Vec::new();
+    string(&mut entry, 1, "location");
+    string(&mut entry, 2, location);
+    bytes(&mut tensor, 13, &entry);
     tensor
 }
 

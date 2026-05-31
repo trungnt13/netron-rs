@@ -6,6 +6,8 @@ use netron_rs_core::{
     Tensor, TensorElementType, TensorStorage, TypeInfo, Value, ValueId,
 };
 
+use crate::validate_external_path;
+
 const FORMAT: &str = "MLIR";
 const INTERNAL_LOCATION_REF: &str = "__mlir_location_ref";
 
@@ -48,6 +50,7 @@ impl ModelFormat for MlirFormat {
         let text = std::str::from_utf8(input.data)
             .map_err(|error| invalid(format!("MLIR text is not UTF-8: {error}")))?;
         let parsed = parse_text(text);
+        validate_external_resource_paths(input.path, &parsed, input.allow_unsafe_paths)?;
         lower_model(parsed)
     }
 }
@@ -674,6 +677,60 @@ fn parse_text(text: &str) -> ParsedModel {
     defer_unscoped_functions(&mut parsed.functions);
     finalize_location_metadata(&mut parsed);
     parsed
+}
+
+fn validate_external_resource_paths(
+    source: Option<&std::path::Path>,
+    parsed: &ParsedModel,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    fn check_location(
+        source: Option<&std::path::Path>,
+        location: &str,
+        allow_unsafe_paths: bool,
+    ) -> Result<(), ModelError> {
+        let location = location.trim().trim_matches('"');
+        if location.starts_with('#') {
+            return Ok(());
+        }
+        validate_external_path(source, location, allow_unsafe_paths)
+    }
+
+    fn check_attributes(
+        source: Option<&std::path::Path>,
+        attributes: &[ParsedAttribute],
+        allow_unsafe_paths: bool,
+    ) -> Result<(), ModelError> {
+        for attribute in attributes {
+            if attribute.name != "rodata" {
+                continue;
+            }
+            if let ParsedAttributeValue::String(value) = &attribute.value
+                && !value.is_empty()
+            {
+                validate_external_path(source, value, allow_unsafe_paths)?;
+            }
+        }
+        Ok(())
+    }
+
+    for module in &parsed.modules {
+        for node in &module.nodes {
+            if let Some(location) = node.metadata.get("location") {
+                check_location(source, location, allow_unsafe_paths)?;
+            }
+            check_attributes(source, &node.attributes, allow_unsafe_paths)?;
+        }
+    }
+    for function in &parsed.functions {
+        for node in &function.nodes {
+            if let Some(location) = node.metadata.get("location") {
+                check_location(source, location, allow_unsafe_paths)?;
+            }
+            check_attributes(source, &node.attributes, allow_unsafe_paths)?;
+        }
+    }
+    Ok(())
 }
 
 fn anonymous_module_count(text: &str) -> usize {

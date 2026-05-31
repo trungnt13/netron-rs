@@ -2,7 +2,7 @@ mod archive;
 mod mlir;
 mod onnx;
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use archive::ZipArchive;
 use netron_rs_core::{Confidence, Model, ModelError, ModelFormat};
@@ -53,6 +53,7 @@ fn parse_zip_container(input: ModelInput<'_>, depth: usize) -> Result<Option<Mod
         let input = ModelInput {
             data: &data,
             path: Some(Path::new(entry.name)),
+            allow_unsafe_paths: input.allow_unsafe_paths,
         };
         match parse_with_containers(input, depth + 1) {
             Ok(candidate) => {
@@ -99,6 +100,79 @@ fn is_supported_zip_wrapper(path: Option<&Path>) -> bool {
         return false;
     };
     file_name.to_ascii_lowercase().ends_with(".onnx.zip")
+}
+
+pub(crate) fn validate_external_path(
+    source: Option<&Path>,
+    location: &str,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    if allow_unsafe_paths || location.is_empty() {
+        return Ok(());
+    }
+    if has_uri_scheme(location)
+        || Path::new(location).is_absolute()
+        || has_unsafe_windows_path(location)
+        || has_parent_component(location)
+    {
+        return Err(access_denied(source, location));
+    }
+    let base_path = source
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let candidate = base_path.join(location);
+    if candidate.exists()
+        && let (Ok(base), Ok(candidate)) = (base_path.canonicalize(), candidate.canonicalize())
+        && !candidate.starts_with(base)
+    {
+        return Err(access_denied(source, location));
+    }
+    Ok(())
+}
+
+fn has_parent_component(location: &str) -> bool {
+    Path::new(location)
+        .components()
+        .any(|component| component == Component::ParentDir)
+        || location
+            .split(['/', '\\'])
+            .any(|component| component == "..")
+}
+
+fn has_unsafe_windows_path(location: &str) -> bool {
+    let bytes = location.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        || location.starts_with("\\\\")
+}
+
+fn has_uri_scheme(location: &str) -> bool {
+    let Some(index) = location.find(':') else {
+        return false;
+    };
+    let scheme = &location[..index];
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        && (location[index + 1..].starts_with("//")
+            || matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "file" | "ftp" | "http" | "https"
+            ))
+}
+
+fn access_denied(source: Option<&Path>, location: &str) -> ModelError {
+    let source = source
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<memory>".to_owned());
+    ModelError::AccessDenied {
+        path: format!("{source} -> {location}"),
+    }
 }
 
 pub use netron_rs_core::{ModelInput, ToNormalizedJson};

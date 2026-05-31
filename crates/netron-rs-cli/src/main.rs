@@ -185,6 +185,7 @@ impl MappedModel {
         ModelInput {
             data: self.data.as_ref(),
             path: Some(self.path.as_path()),
+            allow_unsafe_paths: false,
         }
     }
 

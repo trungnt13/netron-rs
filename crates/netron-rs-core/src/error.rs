@@ -11,6 +11,9 @@ pub enum ModelError {
         message: String,
     },
 
+    #[error("access denied: {path}")]
+    AccessDenied { path: String },
+
     #[error("model invariant failed: {0}")]
     Invariant(String),
 }

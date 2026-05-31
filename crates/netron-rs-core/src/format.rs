@@ -14,6 +14,7 @@ pub enum Confidence {
 pub struct ModelInput<'a> {
     pub data: &'a [u8],
     pub path: Option<&'a Path>,
+    pub allow_unsafe_paths: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

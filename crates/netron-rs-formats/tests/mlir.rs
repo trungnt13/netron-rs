@@ -1,5 +1,8 @@
+use netron_rs_core::ModelError;
 use netron_rs_formats::{ModelInput, ToNormalizedJson, parse};
 use serde_json::json;
+#[cfg(unix)]
+use std::{fs, os::unix::fs::symlink, time::SystemTime};
 
 #[test]
 fn parses_mlir_functions_calls_and_dense_constants() {
@@ -20,6 +23,7 @@ fn parses_mlir_functions_calls_and_dense_constants() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("model.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -49,6 +53,99 @@ fn parses_mlir_functions_calls_and_dense_constants() {
 }
 
 #[test]
+fn rejects_mlir_absolute_node_location() {
+    let location = std::env::temp_dir()
+        .join("netron-rs-denied.bin")
+        .to_string_lossy()
+        .into_owned();
+    let data = mlir_with_location(&location);
+    let error = parse(ModelInput {
+        data: &data,
+        path: Some(std::path::Path::new("module.mlir")),
+        allow_unsafe_paths: false,
+    })
+    .expect_err("absolute node locations should be denied");
+    assert_access_denied(error, "module.mlir", &location);
+}
+
+#[test]
+fn rejects_mlir_node_location_with_traversal() {
+    for location in ["../outside.bin", r"..\outside.bin"] {
+        let data = mlir_with_location(location);
+        let error = parse(ModelInput {
+            data: &data,
+            path: Some(std::path::Path::new("module.mlir")),
+            allow_unsafe_paths: false,
+        })
+        .expect_err("traversal node locations should be denied");
+        assert_access_denied(error, "module.mlir", location);
+    }
+}
+
+#[test]
+fn rejects_mlir_node_uri_locations() {
+    for location in [
+        "http://example.com/t.bin",
+        "ftp://example.com/t.bin",
+        "file://host/share/t.bin",
+    ] {
+        let data = mlir_with_location(location);
+        let error = parse(ModelInput {
+            data: &data,
+            path: Some(std::path::Path::new("module.mlir")),
+            allow_unsafe_paths: false,
+        })
+        .expect_err("uri node locations should be denied");
+        assert_access_denied(error, "module.mlir", location);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_mlir_node_location_symlink_escape_when_canonicalized() {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("netron-mlir-{}", unique));
+    let model_dir = temp_root.join("model");
+    let link_dir = model_dir.join("links");
+    let target_dir = temp_root.join("external");
+    fs::create_dir_all(&link_dir).unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    let model_path = model_dir.join("module.mlir");
+    let target_file = target_dir.join("outside.bin");
+    fs::write(&target_file, b"").unwrap();
+    symlink(&target_file, link_dir.join("outside.bin")).unwrap();
+    let data = mlir_with_location("links/outside.bin");
+
+    let error = parse(ModelInput {
+        data: &data,
+        path: Some(model_path.as_path()),
+        allow_unsafe_paths: false,
+    })
+    .expect_err("symlink escape should be denied");
+
+    assert_access_denied(error, "module.mlir", "links/outside.bin");
+    fs::remove_dir_all(&temp_root).unwrap();
+}
+
+#[test]
+fn parses_mlir_node_location_when_unsafe_allowed() {
+    let location = std::env::temp_dir()
+        .join("netron-rs-trusted.bin")
+        .to_string_lossy()
+        .into_owned();
+    let data = mlir_with_location(&location);
+    let _ = parse(ModelInput {
+        data: &data,
+        path: Some(std::path::Path::new("module.mlir")),
+        allow_unsafe_paths: true,
+    })
+    .expect("unsafe paths should be allowed for MLIR when enabled");
+}
+
+#[test]
 fn parses_legacy_mlir_aliases_prototypes_and_encoded_types() {
     let data = br#"#strided1D = (d0) -> (d0)
 func @gpu_alloc(memref<?xi8>)
@@ -67,6 +164,7 @@ func @helper(%arg0: !torch.vtensor<[3,2],f32>) -> tensor<3x2xf32, #strided1D>
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("legacy.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -116,6 +214,7 @@ fn parses_module_metadata_list_values() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("module-metadata.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -148,6 +247,7 @@ fn propagates_casted_convolution_input_types() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("conv-cast.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -200,6 +300,7 @@ fn parses_module_globals_and_torch_constant_folding() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("globals.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -276,6 +377,7 @@ fn keeps_cfg_block_arguments_out_of_function_inputs() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("loop.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -302,6 +404,7 @@ fn parses_scf_for_bounds_and_iter_args_as_inputs() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("scf-for.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -332,6 +435,7 @@ fn parses_masked_tt_load_operand_segments() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("tt-load.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -370,6 +474,7 @@ fn parses_iree_dispatch_and_subspan_syntax() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("iree-dispatch.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -433,6 +538,7 @@ fn anonymous_module_wrappers_do_not_emit_graphs_or_prefix_functions() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("anonymous.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -459,6 +565,7 @@ module attributes {"triton_gpu.num-warps" = 16 : i32} {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("anonymous-repeated.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -498,6 +605,7 @@ module {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("multi_dump.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -525,6 +633,7 @@ fn unquoted_builtin_module_is_recognized_for_scoping() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("builtin-module.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -550,6 +659,7 @@ fn parses_hal_executable_variant_target_attribute() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("hal-executable-variant.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -578,6 +688,7 @@ fn parses_hal_device_query_key_pair() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("hal-device-query.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -625,6 +736,7 @@ vm.func @main() {
     let model = parse(ModelInput {
         data,
         path: Some(std::path::Path::new("spirv-vm.mlir")),
+        allow_unsafe_paths: false,
     })
     .expect("MLIR parses");
 
@@ -704,4 +816,25 @@ vm.func @main() {
             .unwrap()["attributes"][0]["value"]["value"],
         "device not supported in the compiled configuration"
     );
+}
+
+fn mlir_with_location(location: &str) -> Vec<u8> {
+    format!(
+        r#"module {{
+  func.func @main() {{
+    %0 = arith.constant 0 : i32 loc("{location}")
+    return
+  }}
+}}
+"#
+    )
+    .into_bytes()
+}
+
+fn assert_access_denied(error: ModelError, source: &str, location: &str) {
+    let ModelError::AccessDenied { path } = error else {
+        panic!("expected access denied");
+    };
+    assert!(path.contains(source));
+    assert!(path.contains(location));
 }

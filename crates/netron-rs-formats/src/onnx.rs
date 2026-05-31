@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+};
 
 use netron_rs_core::{
     Attribute, AttributeValue, Confidence, Dimension, DimensionValue, FormatInfo, FormatMetadata,
@@ -7,6 +10,8 @@ use netron_rs_core::{
     TensorStorage, TypeInfo, Value, ValueId,
 };
 use serde_json::Value as JsonValue;
+
+use crate::validate_external_path;
 
 const FORMAT: &str = "ONNX";
 
@@ -73,11 +78,15 @@ impl ModelFormat for OnnxFormat {
             && let Ok(proto) = parse_json_model_proto(input.data)
             && proto.is_onnx_like()
         {
+            validate_model_external_paths(&proto, input.path, input.allow_unsafe_paths)?;
             return lower_model(proto);
         }
 
         let model_error = match ModelProto::decode(input.data) {
-            Ok(proto) if proto.is_onnx_like() => return lower_model(proto),
+            Ok(proto) if proto.is_onnx_like() => {
+                validate_model_external_paths(&proto, input.path, input.allow_unsafe_paths)?;
+                return lower_model(proto);
+            }
             Ok(_) => None,
             Err(error) => Some(error),
         };
@@ -85,12 +94,14 @@ impl ModelFormat for OnnxFormat {
         if let Ok(graph) = GraphProto::decode(input.data)
             && graph.is_graph_like()
         {
+            validate_graph_external_paths(&graph, input.path, input.allow_unsafe_paths)?;
             return lower_graph_model(graph);
         }
 
         if let Ok(tensor) = TensorProto::decode(input.data)
             && tensor.is_tensor_like()
         {
+            validate_tensor_external_paths(&tensor, input.path, input.allow_unsafe_paths)?;
             return Ok(lower_tensor_model(tensor));
         }
 
@@ -209,6 +220,110 @@ fn lower_tensor_model(proto: TensorProto) -> Model {
     graph.add_node(node);
     model.replace_graph(graph_id, graph);
     model
+}
+
+fn validate_model_external_paths(
+    proto: &ModelProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    if let Some(graph) = &proto.graph {
+        validate_graph_external_paths(graph, source, allow_unsafe_paths)?;
+    }
+    for function in &proto.functions {
+        for node in &function.nodes {
+            validate_node_external_paths(node, source, allow_unsafe_paths)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_external_paths(
+    graph: &GraphProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    for tensor in &graph.initializers {
+        validate_tensor_external_paths(tensor, source, allow_unsafe_paths)?;
+    }
+    for tensor in &graph.sparse_initializers {
+        validate_sparse_tensor_external_paths(tensor, source, allow_unsafe_paths)?;
+    }
+    for node in &graph.nodes {
+        validate_node_external_paths(node, source, allow_unsafe_paths)?;
+    }
+    Ok(())
+}
+
+fn validate_node_external_paths(
+    node: &NodeProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    for attribute in &node.attributes {
+        validate_attribute_external_paths(attribute, source, allow_unsafe_paths)?;
+    }
+    Ok(())
+}
+
+fn validate_attribute_external_paths(
+    attribute: &AttributeProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    match &attribute.kind {
+        Some(AttributeKind::Tensor(tensor)) => {
+            validate_tensor_external_paths(tensor, source, allow_unsafe_paths)?
+        }
+        Some(AttributeKind::SparseTensor(tensor)) => {
+            validate_sparse_tensor_external_paths(tensor, source, allow_unsafe_paths)?
+        }
+        Some(AttributeKind::Graph(graph)) => {
+            validate_graph_external_paths(graph, source, allow_unsafe_paths)?
+        }
+        Some(AttributeKind::Tensors(tensors)) => {
+            for tensor in tensors {
+                validate_tensor_external_paths(tensor, source, allow_unsafe_paths)?;
+            }
+        }
+        Some(AttributeKind::SparseTensors(tensors)) => {
+            for tensor in tensors {
+                validate_sparse_tensor_external_paths(tensor, source, allow_unsafe_paths)?;
+            }
+        }
+        Some(AttributeKind::Graphs(graphs)) => {
+            for graph in graphs {
+                validate_graph_external_paths(graph, source, allow_unsafe_paths)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_sparse_tensor_external_paths(
+    tensor: &SparseTensorProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    if let Some(values) = &tensor.values {
+        validate_tensor_external_paths(values, source, allow_unsafe_paths)?;
+    }
+    if let Some(indices) = &tensor.indices {
+        validate_tensor_external_paths(indices, source, allow_unsafe_paths)?;
+    }
+    Ok(())
+}
+
+fn validate_tensor_external_paths(
+    tensor: &TensorProto,
+    source: Option<&Path>,
+    allow_unsafe_paths: bool,
+) -> Result<(), ModelError> {
+    if let Some(location) = tensor.external_data.get("location") {
+        validate_external_path(source, location, allow_unsafe_paths)?;
+    }
+    Ok(())
 }
 
 fn lower_graph(
