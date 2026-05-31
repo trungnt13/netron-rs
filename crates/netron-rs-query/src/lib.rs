@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -3092,8 +3092,14 @@ fn session_slice(
         EntityHandle::MlirOperation { scope, operation } => {
             mlir_operation_slice(model, scope, *operation, &mut builder)?
         }
-        EntityHandle::MlirRegion { scope, .. } | EntityHandle::MlirBlock { scope, .. } => {
-            mlir_scope_slice(model, scope, &mut builder)?
+        EntityHandle::MlirRegion { scope, region } => {
+            mlir_region_slice(model, mlir_index(index)?, scope, *region, &mut builder)?
+        }
+        EntityHandle::MlirBlock { scope, block } => {
+            mlir_block_slice(model, mlir_index(index)?, scope, *block, &mut builder)?
+        }
+        EntityHandle::MlirSymbol { symbol } => {
+            mlir_symbol_slice(model, mlir_index(index)?, *symbol, &mut builder)?
         }
         EntityHandle::MlirDialect { dialect } => mlir_dialect_slice(model, dialect, &mut builder)?,
         EntityHandle::MlirModule { module } => mlir_module_slice(model, *module, &mut builder)?,
@@ -3102,7 +3108,6 @@ fn session_slice(
         | EntityHandle::OperatorSet { .. }
         | EntityHandle::Diagnostic { .. }
         | EntityHandle::MlirValue { .. }
-        | EntityHandle::MlirSymbol { .. }
         | EntityHandle::MlirAttribute { .. }
         | EntityHandle::MlirResource { .. } => return None,
     }
@@ -3150,6 +3155,14 @@ fn session_layout(
         EntityHandle::MlirFunction { function } => {
             mlir_function_layout(model, *function, limits.layout)?
         }
+        EntityHandle::MlirModule { module } => mlir_module_layout(model, *module, limits.layout)?,
+        EntityHandle::MlirRegion { scope, .. } | EntityHandle::MlirBlock { scope, .. } => {
+            if let Some(function) = mlir_scope_index(scope, "function:") {
+                mlir_function_layout(model, function, limits.layout)?
+            } else {
+                mlir_module_layout(model, mlir_scope_index(scope, "module:")?, limits.layout)?
+            }
+        }
         _ => return None,
     };
     let omitted_count =
@@ -3171,6 +3184,13 @@ fn session_layout(
         warnings,
         graph,
     })
+}
+
+fn mlir_index(index: &FormatIndex) -> Option<&MlirIndex> {
+    match index {
+        FormatIndex::Mlir(index) => Some(index),
+        _ => None,
+    }
 }
 
 struct SliceBuilder {
@@ -3291,6 +3311,14 @@ impl SliceBuilder {
             omitted_count,
         });
     }
+
+    fn omit_boundary(&mut self, id: String, reason: &str, omitted_count: usize) {
+        if omitted_count == 0 {
+            return;
+        }
+        self.omitted_count += omitted_count;
+        self.boundary(id, reason, omitted_count);
+    }
 }
 
 fn onnx_graph_slice(model: &Model, graph_index: usize, builder: &mut SliceBuilder) -> Option<()> {
@@ -3306,11 +3334,60 @@ fn onnx_graph_slice(model: &Model, graph_index: usize, builder: &mut SliceBuilde
         let value = &graph.values[value.index()];
         push_onnx_value_entity(model, graph_index, value, builder);
     }
+    push_onnx_boundary_path(model, graph_index, builder);
     for node in &graph.nodes {
+        let node_id = handle_key(&EntityHandle::Node {
+            graph: graph_index,
+            node: node.id.index(),
+        });
+        if builder.entities.len() >= builder.limit && !builder.seen_entities.contains(&node_id) {
+            builder.omit_boundary(
+                handle_key(&EntityHandle::Graph { graph: graph_index }),
+                "graph_node_limit",
+                graph.nodes.len().saturating_sub(node.id.index()),
+            );
+            break;
+        }
         push_onnx_node_entity(model, graph_index, node, builder);
     }
     push_onnx_edges(model, graph_index, builder);
     Some(())
+}
+
+fn push_onnx_boundary_path(model: &Model, graph_index: usize, builder: &mut SliceBuilder) {
+    let Some(graph) = model.graphs.get(graph_index) else {
+        return;
+    };
+    let mut queue = graph.outputs.iter().copied().collect::<VecDeque<_>>();
+    let mut seen_values = BTreeSet::new();
+    let mut seen_nodes = BTreeSet::new();
+    let step_limit = builder.limit.saturating_mul(4).max(1);
+    let mut steps = 0usize;
+    while let Some(value_id) = queue.pop_front() {
+        if steps >= step_limit {
+            builder.omit_boundary(
+                format!("graph:{graph_index}:boundary_path"),
+                "path_limit",
+                queue.len() + 1,
+            );
+            break;
+        }
+        steps += 1;
+        if !seen_values.insert(value_id.index()) {
+            continue;
+        }
+        let value = &graph.values[value_id.index()];
+        push_onnx_value_entity(model, graph_index, value, builder);
+        if let Some(producer) = value.producer
+            && seen_nodes.insert(producer.index())
+        {
+            let node = &graph.nodes[producer.index()];
+            push_onnx_node_entity(model, graph_index, node, builder);
+            for input in node.inputs.iter().flatten() {
+                queue.push_back(*input);
+            }
+        }
+    }
 }
 
 fn onnx_node_slice(
@@ -3527,6 +3604,26 @@ fn mlir_module_slice(model: &Model, module: usize, builder: &mut SliceBuilder) -
         None,
         true,
     );
+    let module_id = handle_key(&EntityHandle::MlirModule { module });
+    for (function, item) in model.functions.iter().enumerate() {
+        if mlir_function_belongs_to_module(model, item, graph) {
+            let function_handle = EntityHandle::MlirFunction { function };
+            let function_id = handle_key(&function_handle);
+            builder.handle(
+                function_handle,
+                "mlir_function",
+                Some(model.strings.get(item.name).to_owned()),
+                None,
+                true,
+            );
+            builder.edge(
+                module_id.clone(),
+                function_id,
+                None,
+                Some("contains".to_owned()),
+            );
+        }
+    }
     for node in &graph.nodes {
         builder.handle(
             EntityHandle::MlirOperation {
@@ -3726,6 +3823,213 @@ fn mlir_operation_slice(
     Some(())
 }
 
+fn mlir_region_slice(
+    model: &Model,
+    index: &MlirIndex,
+    scope: &str,
+    region: usize,
+    builder: &mut SliceBuilder,
+) -> Option<()> {
+    let handle = EntityHandle::MlirRegion {
+        scope: scope.to_owned(),
+        region,
+    };
+    index
+        .summary
+        .regions
+        .iter()
+        .any(|item| item.scope_id == scope && item.handle == handle)
+        .then_some(())?;
+    builder.handle(
+        handle,
+        "mlir_region",
+        Some(format!("{scope} region {region}")),
+        None,
+        true,
+    );
+    mlir_scope_slice(model, scope, builder)
+}
+
+fn mlir_block_slice(
+    model: &Model,
+    index: &MlirIndex,
+    scope: &str,
+    block: usize,
+    builder: &mut SliceBuilder,
+) -> Option<()> {
+    let handle = EntityHandle::MlirBlock {
+        scope: scope.to_owned(),
+        block,
+    };
+    index
+        .summary
+        .blocks
+        .iter()
+        .any(|item| item.scope_id == scope && item.handle == handle)
+        .then_some(())?;
+    builder.handle(
+        handle,
+        "mlir_block",
+        Some(format!("{scope} block {block}")),
+        None,
+        true,
+    );
+    mlir_scope_slice(model, scope, builder)
+}
+
+fn mlir_symbol_slice(
+    model: &Model,
+    index: &MlirIndex,
+    symbol: usize,
+    builder: &mut SliceBuilder,
+) -> Option<()> {
+    let symbol_name = index.symbols.get(symbol)?;
+    let symbol_id = handle_key(&EntityHandle::MlirSymbol { symbol });
+    builder.handle(
+        EntityHandle::MlirSymbol { symbol },
+        "mlir_symbol",
+        Some(format!("@{symbol_name}")),
+        None,
+        true,
+    );
+
+    for (module, graph) in model.graphs.iter().enumerate() {
+        let scope = mlir_module_scope(module);
+        if graph
+            .name
+            .is_some_and(|name| mlir_symbol_matches(model.strings.get(name), symbol_name))
+        {
+            let module_handle = EntityHandle::MlirModule { module };
+            let module_id = handle_key(&module_handle);
+            builder.handle(
+                module_handle,
+                "mlir_module",
+                graph.name.map(|name| model.strings.get(name).to_owned()),
+                None,
+                true,
+            );
+            builder.edge(
+                symbol_id.clone(),
+                module_id,
+                None,
+                Some("defines".to_owned()),
+            );
+        }
+        for (operation, node) in graph.nodes.iter().enumerate() {
+            if mlir_node_mentions_symbol(model, node, symbol_name) {
+                let operation_handle = EntityHandle::MlirOperation {
+                    scope: scope.clone(),
+                    operation,
+                };
+                let operation_id = handle_key(&operation_handle);
+                builder.handle(
+                    operation_handle,
+                    "mlir_operation",
+                    node.name.map(|name| model.strings.get(name).to_owned()),
+                    Some(model.strings.get(node.operator.name).to_owned()),
+                    false,
+                );
+                builder.edge(
+                    symbol_id.clone(),
+                    operation_id,
+                    None,
+                    Some("references".to_owned()),
+                );
+            }
+        }
+    }
+
+    for (function, item) in model.functions.iter().enumerate() {
+        let scope = mlir_function_scope(function);
+        if mlir_symbol_matches(model.strings.get(item.name), symbol_name) {
+            let function_handle = EntityHandle::MlirFunction { function };
+            let function_id = handle_key(&function_handle);
+            builder.handle(
+                function_handle,
+                "mlir_function",
+                Some(model.strings.get(item.name).to_owned()),
+                None,
+                true,
+            );
+            builder.edge(
+                symbol_id.clone(),
+                function_id,
+                None,
+                Some("defines".to_owned()),
+            );
+        }
+        for (operation, node) in item.nodes.iter().enumerate() {
+            if mlir_function_node_mentions_symbol(model, node, symbol_name) {
+                let operation_handle = EntityHandle::MlirOperation {
+                    scope: scope.clone(),
+                    operation,
+                };
+                let operation_id = handle_key(&operation_handle);
+                builder.handle(
+                    operation_handle,
+                    "mlir_operation",
+                    node.name.map(|name| model.strings.get(name).to_owned()),
+                    Some(model.strings.get(node.operator.name).to_owned()),
+                    false,
+                );
+                builder.edge(
+                    symbol_id.clone(),
+                    operation_id,
+                    None,
+                    Some("references".to_owned()),
+                );
+            }
+        }
+    }
+    Some(())
+}
+
+fn mlir_function_belongs_to_module(
+    model: &Model,
+    function: &Function,
+    graph: &netron_rs_core::Graph,
+) -> bool {
+    let Some(module_name) = graph.name.map(|name| model.strings.get(name)) else {
+        return model.graphs.len() == 1;
+    };
+    let module_name = module_name.trim_start_matches('@');
+    let function_name = model.strings.get(function.name).trim_start_matches('@');
+    function_name.starts_with(&format!("{module_name}::"))
+        || (model.graphs.len() == 1 && !function_name.contains("::"))
+}
+
+fn mlir_node_mentions_symbol(model: &Model, node: &Node, symbol: &str) -> bool {
+    node.name
+        .is_some_and(|name| mlir_symbol_matches(model.strings.get(name), symbol))
+        || node
+            .attributes
+            .iter()
+            .any(|attribute| mlir_attribute_mentions_symbol(model, attribute, symbol))
+}
+
+fn mlir_function_node_mentions_symbol(model: &Model, node: &FunctionNode, symbol: &str) -> bool {
+    node.name
+        .is_some_and(|name| mlir_symbol_matches(model.strings.get(name), symbol))
+        || node
+            .attributes
+            .iter()
+            .any(|attribute| mlir_attribute_mentions_symbol(model, attribute, symbol))
+}
+
+fn mlir_attribute_mentions_symbol(model: &Model, attribute: &Attribute, symbol: &str) -> bool {
+    mlir_symbol_matches(model.strings.get(attribute.name), symbol)
+        || attribute_value_terms(model, &attribute.value)
+            .iter()
+            .any(|term| mlir_symbol_matches(term, symbol))
+}
+
+fn mlir_symbol_matches(value: &str, symbol: &str) -> bool {
+    let value = value.trim_start_matches('@');
+    value == symbol
+        || value.ends_with(&format!("::{symbol}"))
+        || value.ends_with(&format!("::@{symbol}"))
+}
+
 fn mlir_scope_slice(model: &Model, scope: &str, builder: &mut SliceBuilder) -> Option<()> {
     if let Some(function) = mlir_scope_index(scope, "function:") {
         return mlir_function_slice(model, function, builder);
@@ -3885,6 +4189,18 @@ fn mlir_function_layout(model: &Model, function_index: usize, limit: usize) -> O
         edges,
         stats,
     })
+}
+
+fn mlir_module_layout(model: &Model, module_index: usize, limit: usize) -> Option<LayoutGraph> {
+    netron_rs_layout::layout_graph(
+        model,
+        &LayoutOptions {
+            graph: module_index,
+            max_nodes: Some(limit),
+            ..LayoutOptions::default()
+        },
+    )
+    .ok()
 }
 
 fn layout_node(
@@ -4905,6 +5221,18 @@ mod tests {
                 .iter()
                 .any(|handle| matches!(handle, EntityHandle::MlirRegion { .. }))
         );
+        let module_slice = session
+            .slice(
+                &EntityHandle::MlirModule { module: 0 },
+                &SessionLimits::default(),
+            )
+            .expect("module slice");
+        assert!(
+            module_slice
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.handle, Some(EntityHandle::MlirFunction { .. })))
+        );
 
         let function_handle = session
             .search("loop", &SessionLimits::default())
@@ -5174,6 +5502,22 @@ mod tests {
                     && entity_ids.contains(edge.to.as_str()))
         );
 
+        let graph_slice = session
+            .slice(
+                &EntityHandle::Graph { graph: 0 },
+                &SessionLimits {
+                    slice: 4,
+                    ..SessionLimits::default()
+                },
+            )
+            .expect("graph slice");
+        assert!(
+            graph_slice
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.handle, Some(EntityHandle::Node { node: 1, .. })))
+        );
+
         let layout = session
             .layout(
                 &EntityHandle::Graph { graph: 0 },
@@ -5187,6 +5531,101 @@ mod tests {
         assert!(layout.truncated);
         assert_eq!(layout.graph.stats.omitted_nodes, 1);
         assert!(layout.cache_key.contains("format:Onnx"));
+    }
+
+    #[test]
+    #[ignore = "writes Goal 6 evidence artifacts from the local Netron corpus"]
+    fn goal6_layout_metadata_artifacts_for_large_fixtures() {
+        use std::{fs, path::Path};
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("workspace root");
+        let fixture_root = repo_root.join("netron/third_party/test");
+        let artifact_root = repo_root.join("artifacts/goal-6/layout-metadata");
+        fs::create_dir_all(&artifact_root).expect("artifact directory");
+
+        for (fixture, scope) in [
+            ("onnx/gpt-oss-20b.onnx", EntityHandle::Graph { graph: 0 }),
+            (
+                "onnx/phi3-mini-128k-instruct-cuda-fp16.onnx",
+                EntityHandle::Graph { graph: 0 },
+            ),
+            ("onnx/longformer.onnx.zip", EntityHandle::Graph { graph: 0 }),
+            (
+                "mlir/examples.mnist_xla.mlir",
+                EntityHandle::MlirFunction { function: 0 },
+            ),
+            (
+                "mlir/stablehlo_gpt_125M.mlir",
+                EntityHandle::MlirFunction { function: 0 },
+            ),
+        ] {
+            let path = fixture_root.join(fixture);
+            let data = fs::read(&path).expect("read Goal 6 fixture");
+            let session =
+                ModelSession::open(&data, ModelSource::from_file(path.clone(), data.len()))
+                    .expect("open Goal 6 fixture");
+            let summary = session.summary(&SessionLimits::default());
+            let summary_json = serde_json::to_value(&summary).expect("summary json");
+            assert!(summary_json.get("layout").is_none());
+            assert!(summary_json.get("slice").is_none());
+
+            let slice = session
+                .slice(
+                    &scope,
+                    &SessionLimits {
+                        slice: 2,
+                        ..SessionLimits::default()
+                    },
+                )
+                .expect("bounded slice");
+            let layout = session
+                .layout(
+                    &scope,
+                    &SessionLimits {
+                        layout: 1,
+                        ..SessionLimits::default()
+                    },
+                )
+                .expect("bounded layout");
+            let artifact = serde_json::json!({
+                "fixture": fixture,
+                "format": summary.format,
+                "open_has_no_layout_payload": true,
+                "open_has_no_slice_payload": true,
+                "slice": {
+                    "limit_used": slice.limit_used,
+                    "truncated": slice.truncated,
+                    "omitted_count": slice.omitted_count,
+                    "warnings": slice.warnings.len(),
+                    "entities": slice.entities.len(),
+                    "edges": slice.edges.len(),
+                    "boundaries": slice.boundaries.len(),
+                    "cache_key": slice.cache_key,
+                },
+                "layout": {
+                    "limit_used": layout.limit_used,
+                    "truncated": layout.truncated,
+                    "omitted_count": layout.omitted_count,
+                    "warnings": layout.warnings.len(),
+                    "nodes": layout.graph.nodes.len(),
+                    "edges": layout.graph.edges.len(),
+                    "cache_key": layout.cache_key,
+                },
+            });
+            let name = Path::new(fixture)
+                .file_name()
+                .expect("fixture name")
+                .to_string_lossy()
+                .replace('.', "_");
+            fs::write(
+                artifact_root.join(format!("{name}.json")),
+                serde_json::to_string_pretty(&artifact).expect("artifact json"),
+            )
+            .expect("write Goal 6 artifact");
+        }
     }
 
     #[test]
@@ -5240,6 +5679,55 @@ mod tests {
                 .iter()
                 .any(|edge| edge.from.starts_with("mlir_value:function:0:")
                     && edge.to == "mlir_operation:function:0:1")
+        );
+
+        let region = session
+            .slice(
+                &EntityHandle::MlirRegion {
+                    scope: "function:0".to_owned(),
+                    region: 0,
+                },
+                &SessionLimits::default(),
+            )
+            .expect("region slice");
+        assert!(
+            region
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.handle, Some(EntityHandle::MlirRegion { .. })))
+        );
+
+        let block = session
+            .slice(
+                &EntityHandle::MlirBlock {
+                    scope: "function:0".to_owned(),
+                    block: 0,
+                },
+                &SessionLimits::default(),
+            )
+            .expect("block slice");
+        assert!(
+            block
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.handle, Some(EntityHandle::MlirBlock { .. })))
+        );
+
+        let symbol_handle = session
+            .search("loop", &SessionLimits::default())
+            .into_iter()
+            .find_map(|hit| {
+                matches!(hit.handle, EntityHandle::MlirSymbol { .. }).then_some(hit.handle)
+            })
+            .expect("symbol hit");
+        let symbol = session
+            .slice(&symbol_handle, &SessionLimits::default())
+            .expect("symbol slice");
+        assert!(
+            symbol
+                .entities
+                .iter()
+                .any(|entity| matches!(entity.handle, Some(EntityHandle::MlirFunction { .. })))
         );
 
         let layout = session
