@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 
 #[test]
 fn parses_tflite_split_skipgram_lstm_and_unpack_options() {
+    if !external_tflite_fixtures_available() {
+        return;
+    }
+
     let smartreply = parse_fixture("smartreply.tflite");
     let skip_gram = find_node(&smartreply, "SkipGram");
     assert_eq!(
@@ -64,6 +68,10 @@ fn parses_tflite_split_skipgram_lstm_and_unpack_options() {
 
 #[test]
 fn hides_tflite_custom_fused_activation_attribute_like_netron() {
+    if !external_tflite_fixtures_available() {
+        return;
+    }
+
     let quicknet = parse_fixture("quicknet.tflite");
     let node = find_node(&quicknet, "LceBconv2d");
     let attributes = node["attributes"].as_array().expect("attributes array");
@@ -90,9 +98,24 @@ fn parse_fixture(name: &str) -> Value {
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../netron/third_party/test/tflite")
-        .join(name)
+    fixture_root().join(name)
+}
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../netron/third_party/test/tflite")
+}
+
+fn external_tflite_fixtures_available() -> bool {
+    let root = fixture_root();
+    if root.is_dir() {
+        true
+    } else {
+        eprintln!(
+            "skipping external TFLite corpus tests; {} is missing",
+            root.display()
+        );
+        false
+    }
 }
 
 fn find_node<'a>(model: &'a Value, operator: &str) -> &'a Value {
