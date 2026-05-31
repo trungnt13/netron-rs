@@ -28,6 +28,7 @@ and future web/VS Code clients.
   - `diagnostics(limits) -> DiagnosticsResponse`
   - `search(query, limits) -> SearchEntry[]`
   - `tensor_metadata(limits) -> TensorMetadata[]`
+  - `detail(handle, limits) -> EntityDetail?`
 
 ## Format and Handle Types
 
@@ -43,6 +44,7 @@ and future web/VS Code clients.
   - `{ "kind": "function", "function": 1 }`
   - `{ "kind": "metadata", "owner": "model", "key": "license" }`
   - `{ "kind": "operator_set", "domain": "ai.onnx", "version": 18 }`
+  - `{ "kind": "diagnostic", "diagnostic": 0 }`
 
 ## Shared Limits
 
@@ -71,11 +73,13 @@ and future web/VS Code clients.
   - `initializers`, `subgraphs`, `sparse_tensors`, `metadata`, `opsets`
   - `external_data`, `mlir_resources`
   - `onnx`: optional ONNX-specific summary block with producer fields,
-    per-kind counts, opsets, and metadata keys
+    per-kind counts, opsets, metadata keys, graph summaries, and bounded
+    histograms for operator type, domain, dtype, storage kind, shape rank,
+    fan-in, and fan-out
 - `DiagnosticsResponse`
   - `api_version`
   - `session_id`
-  - `diagnostics` (list)
+  - `diagnostics` (list; format-specific diagnostics may include handles)
   - `truncated`
 - `SearchEntry`
   - `kind`, `handle`, `graph`, `id`, `name`, `operator`, `origin`
@@ -83,6 +87,8 @@ and future web/VS Code clients.
   - `handle`, `name`, `element_type`, `shape`, `storage`
   - optional `byte_len`, `element_count`, `external_data`, sparse tensor links,
     and metadata
+- `EntityDetail`
+  - `handle`, `title`, bounded string `fields`, and bounded related handles
 
 ## Error Mapping
 

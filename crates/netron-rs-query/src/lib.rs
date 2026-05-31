@@ -5,8 +5,8 @@ use std::{
 };
 
 use netron_rs_core::{
-    AttributeValue, DimensionValue, Model, ModelError, ModelInput, Tensor, TensorElementType,
-    TensorStorage,
+    AttributeValue, Dimension, DimensionValue, Model, ModelError, ModelInput, Operator, Tensor,
+    TensorElementType, TensorStorage,
 };
 use serde::Serialize;
 
@@ -64,6 +64,9 @@ pub enum EntityHandle {
     OperatorSet {
         domain: Option<String>,
         version: i64,
+    },
+    Diagnostic {
+        diagnostic: usize,
     },
 }
 
@@ -149,6 +152,8 @@ pub enum DiagnosticKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Diagnostic {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<EntityHandle>,
     pub kind: DiagnosticKind,
     pub code: &'static str,
     pub message: String,
@@ -173,12 +178,56 @@ pub struct OnnxSummary {
     pub sparse_tensor_count: usize,
     pub opsets: Vec<OnnxOperatorSet>,
     pub metadata_keys: Vec<String>,
+    pub graph_summaries: Vec<OnnxGraphSummary>,
+    pub histograms: OnnxHistograms,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OnnxOperatorSet {
     pub domain: Option<String>,
     pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OnnxGraphSummary {
+    pub handle: EntityHandle,
+    pub name: Option<String>,
+    pub node_count: usize,
+    pub value_count: usize,
+    pub tensor_count: usize,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub initializer_count: usize,
+    pub subgraph_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OnnxHistograms {
+    pub graph_node_counts: Vec<HistogramEntry>,
+    pub graph_value_counts: Vec<HistogramEntry>,
+    pub graph_tensor_counts: Vec<HistogramEntry>,
+    pub operator_types: Vec<HistogramEntry>,
+    pub domains: Vec<HistogramEntry>,
+    pub dtypes: Vec<HistogramEntry>,
+    pub storage_kinds: Vec<HistogramEntry>,
+    pub shape_ranks: Vec<HistogramEntry>,
+    pub fan_in: Vec<HistogramEntry>,
+    pub fan_out: Vec<HistogramEntry>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct HistogramEntry {
+    pub key: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityDetail {
+    pub handle: EntityHandle,
+    pub title: String,
+    pub fields: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<EntityHandle>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +265,8 @@ pub enum TensorStorageKind {
 pub struct OnnxIndex {
     entries: Vec<SearchEntry>,
     tensor_metadata: Vec<TensorMetadata>,
+    graph_summaries: Vec<OnnxGraphSummary>,
+    histograms: OnnxHistograms,
     graph_count: usize,
     function_count: usize,
     node_count: usize,
@@ -454,6 +505,8 @@ impl OnnxIndex {
         let initializer_count = initializer_count(model);
         let sparse_tensor_count = sparse_tensor_count(model);
         let tensor_metadata = tensor_metadata(model);
+        let graph_summaries = graph_summaries(model);
+        let histograms = onnx_histograms(model);
         let opsets = model
             .metadata
             .opsets
@@ -463,10 +516,13 @@ impl OnnxIndex {
                 version: entry.version,
             })
             .collect();
+        assign_diagnostic_handles(&mut diagnostics);
 
         Self {
             entries,
             tensor_metadata,
+            graph_summaries,
+            histograms,
             graph_count,
             function_count,
             node_count,
@@ -488,6 +544,15 @@ impl OnnxIndex {
     pub fn tensor_metadata(&self, limit: usize) -> Vec<TensorMetadata> {
         self.tensor_metadata.iter().take(limit).cloned().collect()
     }
+
+    pub fn detail(
+        &self,
+        model: &Model,
+        handle: &EntityHandle,
+        limit: usize,
+    ) -> Option<EntityDetail> {
+        onnx_detail(model, self, handle, limit)
+    }
 }
 
 fn attribute_diagnostic(
@@ -499,6 +564,7 @@ fn attribute_diagnostic(
 ) -> Option<Diagnostic> {
     match value {
         AttributeValue::Unsupported(message) => Some(Diagnostic {
+            handle: None,
             kind: DiagnosticKind::Warning,
             code: "onnx.unsupported_attribute",
             message: format!(
@@ -510,6 +576,12 @@ fn attribute_diagnostic(
     }
 }
 
+fn assign_diagnostic_handles(diagnostics: &mut [Diagnostic]) {
+    for (index, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic.handle = Some(EntityHandle::Diagnostic { diagnostic: index });
+    }
+}
+
 fn searchable_terms(name: Option<String>, metadata: &BTreeMap<String, String>) -> Vec<String> {
     let mut search = Vec::new();
     if let Some(name) = name {
@@ -518,6 +590,170 @@ fn searchable_terms(name: Option<String>, metadata: &BTreeMap<String, String>) -
     search.extend(metadata.keys().cloned());
     search.extend(metadata.values().cloned());
     search
+}
+
+fn graph_summaries(model: &Model) -> Vec<OnnxGraphSummary> {
+    model
+        .graphs
+        .iter()
+        .enumerate()
+        .map(|(index, graph)| {
+            let initializer_count = graph
+                .values
+                .iter()
+                .filter(|value| value.initializer.is_some())
+                .count();
+            OnnxGraphSummary {
+                handle: EntityHandle::Graph { graph: index },
+                name: graph.name.map(|id| model.strings.get(id).to_owned()),
+                node_count: graph.nodes.len(),
+                value_count: graph.values.len(),
+                tensor_count: initializer_count,
+                input_count: graph.inputs.len(),
+                output_count: graph.outputs.len(),
+                initializer_count,
+                subgraph_count: graph.subgraphs.len(),
+            }
+        })
+        .collect()
+}
+
+fn onnx_histograms(model: &Model) -> OnnxHistograms {
+    let mut graph_node_counts = BTreeMap::new();
+    let mut graph_value_counts = BTreeMap::new();
+    let mut graph_tensor_counts = BTreeMap::new();
+    let mut operator_types = BTreeMap::new();
+    let mut domains = BTreeMap::new();
+    let mut dtypes = BTreeMap::new();
+    let mut storage_kinds = BTreeMap::new();
+    let mut shape_ranks = BTreeMap::new();
+    let mut fan_in = BTreeMap::new();
+    let mut fan_out = BTreeMap::new();
+
+    for graph in &model.graphs {
+        let graph_tensor_count = graph
+            .values
+            .iter()
+            .filter(|value| value.initializer.is_some())
+            .count();
+        increment(&mut graph_node_counts, graph.nodes.len().to_string());
+        increment(&mut graph_value_counts, graph.values.len().to_string());
+        increment(&mut graph_tensor_counts, graph_tensor_count.to_string());
+
+        for node in &graph.nodes {
+            record_operator_histograms(
+                model,
+                &node.operator,
+                node.inputs.iter().flatten().count(),
+                node.outputs.iter().flatten().count(),
+                &mut operator_types,
+                &mut domains,
+                &mut fan_in,
+                &mut fan_out,
+            );
+        }
+        for value in &graph.values {
+            if let Some(type_info) = &value.type_info {
+                if let Some(element_type) = &type_info.element_type {
+                    increment(&mut dtypes, element_type_name(element_type));
+                }
+                increment(&mut shape_ranks, type_info.shape.len().to_string());
+            }
+        }
+    }
+
+    for function in &model.functions {
+        for node in &function.nodes {
+            record_operator_histograms(
+                model,
+                &node.operator,
+                node.inputs.iter().flatten().count(),
+                node.outputs.iter().flatten().count(),
+                &mut operator_types,
+                &mut domains,
+                &mut fan_in,
+                &mut fan_out,
+            );
+        }
+        for value in &function.values {
+            if let Some(type_info) = &value.type_info {
+                if let Some(element_type) = &type_info.element_type {
+                    increment(&mut dtypes, element_type_name(element_type));
+                }
+                increment(&mut shape_ranks, type_info.shape.len().to_string());
+            }
+        }
+    }
+
+    for tensor in &model.tensors {
+        increment(&mut dtypes, element_type_name(&tensor.element_type));
+        increment(
+            &mut storage_kinds,
+            storage_kind_name(&tensor.storage).to_owned(),
+        );
+        increment(&mut shape_ranks, tensor.shape.len().to_string());
+    }
+
+    OnnxHistograms {
+        graph_node_counts: histogram_entries(graph_node_counts),
+        graph_value_counts: histogram_entries(graph_value_counts),
+        graph_tensor_counts: histogram_entries(graph_tensor_counts),
+        operator_types: histogram_entries(operator_types),
+        domains: histogram_entries(domains),
+        dtypes: histogram_entries(dtypes),
+        storage_kinds: histogram_entries(storage_kinds),
+        shape_ranks: histogram_entries(shape_ranks),
+        fan_in: histogram_entries(fan_in),
+        fan_out: histogram_entries(fan_out),
+    }
+}
+
+fn record_operator_histograms(
+    model: &Model,
+    operator: &Operator,
+    inputs: usize,
+    outputs: usize,
+    operator_types: &mut BTreeMap<String, usize>,
+    domains: &mut BTreeMap<String, usize>,
+    fan_in: &mut BTreeMap<String, usize>,
+    fan_out: &mut BTreeMap<String, usize>,
+) {
+    increment(operator_types, model.strings.get(operator.name).to_owned());
+    increment(domains, operator_domain(model, operator));
+    increment(fan_in, inputs.to_string());
+    increment(fan_out, outputs.to_string());
+}
+
+fn increment(map: &mut BTreeMap<String, usize>, key: String) {
+    *map.entry(key).or_default() += 1;
+}
+
+fn histogram_entries(map: BTreeMap<String, usize>) -> Vec<HistogramEntry> {
+    let mut entries = map
+        .into_iter()
+        .map(|(key, count)| HistogramEntry { key, count })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.count.cmp(&left.count).then(left.key.cmp(&right.key)));
+    entries
+}
+
+fn limit_histograms(histograms: &OnnxHistograms, limit: usize) -> OnnxHistograms {
+    OnnxHistograms {
+        graph_node_counts: limit_histogram_entries(&histograms.graph_node_counts, limit),
+        graph_value_counts: limit_histogram_entries(&histograms.graph_value_counts, limit),
+        graph_tensor_counts: limit_histogram_entries(&histograms.graph_tensor_counts, limit),
+        operator_types: limit_histogram_entries(&histograms.operator_types, limit),
+        domains: limit_histogram_entries(&histograms.domains, limit),
+        dtypes: limit_histogram_entries(&histograms.dtypes, limit),
+        storage_kinds: limit_histogram_entries(&histograms.storage_kinds, limit),
+        shape_ranks: limit_histogram_entries(&histograms.shape_ranks, limit),
+        fan_in: limit_histogram_entries(&histograms.fan_in, limit),
+        fan_out: limit_histogram_entries(&histograms.fan_out, limit),
+    }
+}
+
+fn limit_histogram_entries(entries: &[HistogramEntry], limit: usize) -> Vec<HistogramEntry> {
+    entries.iter().take(limit).cloned().collect()
 }
 
 fn tensor_metadata(model: &Model) -> Vec<TensorMetadata> {
@@ -598,6 +834,23 @@ fn element_type_name(element_type: &TensorElementType) -> String {
     match element_type {
         TensorElementType::Other(value) => value.clone(),
         _ => format!("{element_type:?}").to_ascii_lowercase(),
+    }
+}
+
+fn operator_domain(model: &Model, operator: &Operator) -> String {
+    operator
+        .domain
+        .map(|domain| model.strings.get(domain).to_owned())
+        .unwrap_or_else(|| "default".to_owned())
+}
+
+fn storage_kind_name(storage: &TensorStorage) -> &'static str {
+    match storage {
+        TensorStorage::Absent => "absent",
+        TensorStorage::InlineBytes { .. } => "inline_bytes",
+        TensorStorage::ElementList { .. } => "element_list",
+        TensorStorage::External { .. } => "external",
+        TensorStorage::Sparse { .. } => "sparse",
     }
 }
 
@@ -693,6 +946,414 @@ fn opset_count(model: &Model) -> usize {
             .sum::<usize>()
 }
 
+fn onnx_detail(
+    model: &Model,
+    index: &OnnxIndex,
+    handle: &EntityHandle,
+    limit: usize,
+) -> Option<EntityDetail> {
+    match handle {
+        EntityHandle::Graph { graph } => graph_detail(model, *graph, limit),
+        EntityHandle::Node { graph, node } => node_detail(model, *graph, *node, limit),
+        EntityHandle::Value { graph, value } => value_detail(model, *graph, *value, limit),
+        EntityHandle::Tensor { tensor } => tensor_detail(index, *tensor, limit),
+        EntityHandle::Function { function } => function_detail(model, *function),
+        EntityHandle::Metadata { owner, key } => metadata_detail(model, owner, key),
+        EntityHandle::OperatorSet { domain, version } => {
+            opset_detail(model, domain.as_deref(), *version)
+        }
+        EntityHandle::Diagnostic { diagnostic } => diagnostic_detail(index, *diagnostic),
+    }
+}
+
+fn graph_detail(model: &Model, graph_index: usize, limit: usize) -> Option<EntityDetail> {
+    let graph = model.graphs.get(graph_index)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_count".to_owned(), graph.nodes.len().to_string());
+    fields.insert("value_count".to_owned(), graph.values.len().to_string());
+    fields.insert("input_count".to_owned(), graph.inputs.len().to_string());
+    fields.insert("output_count".to_owned(), graph.outputs.len().to_string());
+    fields.insert(
+        "subgraph_count".to_owned(),
+        graph.subgraphs.len().to_string(),
+    );
+    let tensor_count = graph
+        .values
+        .iter()
+        .filter(|value| value.initializer.is_some())
+        .count();
+    fields.insert("tensor_count".to_owned(), tensor_count.to_string());
+    fields.insert("initializer_count".to_owned(), tensor_count.to_string());
+    add_metadata_fields(&mut fields, &graph.metadata);
+
+    let mut related = Vec::new();
+    for node in &graph.nodes {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Node {
+                graph: graph_index,
+                node: node.id.index(),
+            },
+        );
+    }
+    for subgraph in &graph.subgraphs {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Graph {
+                graph: subgraph.index(),
+            },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::Graph { graph: graph_index },
+        title: graph
+            .name
+            .map(|id| model.strings.get(id).to_owned())
+            .unwrap_or_else(|| format!("graph {graph_index}")),
+        fields,
+        related,
+    })
+}
+
+fn node_detail(
+    model: &Model,
+    graph_index: usize,
+    node_index: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let graph = model.graphs.get(graph_index)?;
+    let node = graph.nodes.get(node_index)?;
+    let mut fields = BTreeMap::new();
+    if let Some(name) = node.name {
+        fields.insert("name".to_owned(), model.strings.get(name).to_owned());
+    }
+    fields.insert(
+        "operator".to_owned(),
+        model.strings.get(node.operator.name).to_owned(),
+    );
+    fields.insert("domain".to_owned(), operator_domain(model, &node.operator));
+    fields.insert("origin".to_owned(), node.operator.origin.to_owned());
+    if let Some(version) = node.operator.version {
+        fields.insert("version".to_owned(), version.to_string());
+    }
+    fields.insert(
+        "input_count".to_owned(),
+        node.inputs.iter().flatten().count().to_string(),
+    );
+    fields.insert(
+        "output_count".to_owned(),
+        node.outputs.iter().flatten().count().to_string(),
+    );
+    fields.insert(
+        "attribute_count".to_owned(),
+        node.attributes.len().to_string(),
+    );
+    add_metadata_fields(&mut fields, &node.metadata);
+
+    let mut related = Vec::new();
+    for value in node.inputs.iter().chain(&node.outputs).flatten() {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Value {
+                graph: graph_index,
+                value: value.index(),
+            },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::Node {
+            graph: graph_index,
+            node: node_index,
+        },
+        title: node
+            .name
+            .map(|id| model.strings.get(id).to_owned())
+            .unwrap_or_else(|| model.strings.get(node.operator.name).to_owned()),
+        fields,
+        related,
+    })
+}
+
+fn value_detail(
+    model: &Model,
+    graph_index: usize,
+    value_index: usize,
+    limit: usize,
+) -> Option<EntityDetail> {
+    let graph = model.graphs.get(graph_index)?;
+    let value = graph.values.get(value_index)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_owned(), model.strings.get(value.name).to_owned());
+    fields.insert(
+        "consumer_count".to_owned(),
+        value.consumers.len().to_string(),
+    );
+    fields.insert(
+        "is_graph_input".to_owned(),
+        value.is_graph_input.to_string(),
+    );
+    fields.insert(
+        "is_graph_output".to_owned(),
+        value.is_graph_output.to_string(),
+    );
+    if let Some(type_info) = &value.type_info {
+        add_type_fields(
+            model,
+            &mut fields,
+            type_info.element_type.as_ref(),
+            &type_info.shape,
+        );
+    }
+    add_metadata_fields(&mut fields, &value.metadata);
+
+    let mut related = Vec::new();
+    if let Some(producer) = value.producer {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Node {
+                graph: graph_index,
+                node: producer.index(),
+            },
+        );
+    }
+    for consumer in &value.consumers {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Node {
+                graph: graph_index,
+                node: consumer.index(),
+            },
+        );
+    }
+    if let Some(tensor) = value.initializer {
+        fields.insert("initializer".to_owned(), tensor.index().to_string());
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Tensor {
+                tensor: tensor.index(),
+            },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: EntityHandle::Value {
+            graph: graph_index,
+            value: value_index,
+        },
+        title: model.strings.get(value.name).to_owned(),
+        fields,
+        related,
+    })
+}
+
+fn tensor_detail(index: &OnnxIndex, tensor_index: usize, limit: usize) -> Option<EntityDetail> {
+    let tensor = index.tensor_metadata.get(tensor_index)?;
+    let mut fields = BTreeMap::new();
+    if let Some(name) = &tensor.name {
+        fields.insert("name".to_owned(), name.clone());
+    }
+    fields.insert("element_type".to_owned(), tensor.element_type.clone());
+    fields.insert("rank".to_owned(), tensor.shape.len().to_string());
+    fields.insert("shape".to_owned(), tensor.shape.join(","));
+    fields.insert(
+        "storage".to_owned(),
+        tensor_storage_kind_name(tensor.storage).to_owned(),
+    );
+    if let Some(byte_len) = tensor.byte_len {
+        fields.insert("byte_len".to_owned(), byte_len.to_string());
+    }
+    if let Some(element_count) = tensor.element_count {
+        fields.insert("element_count".to_owned(), element_count.to_string());
+    }
+    for (key, value) in &tensor.external_data {
+        fields.insert(format!("external.{key}"), value.clone());
+    }
+    add_metadata_fields(&mut fields, &tensor.metadata);
+
+    let mut related = Vec::new();
+    if let Some(values) = tensor.sparse_values {
+        push_related(&mut related, limit, EntityHandle::Tensor { tensor: values });
+    }
+    if let Some(indices) = tensor.sparse_indices {
+        push_related(
+            &mut related,
+            limit,
+            EntityHandle::Tensor { tensor: indices },
+        );
+    }
+
+    Some(EntityDetail {
+        handle: tensor.handle.clone(),
+        title: tensor
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("tensor {tensor_index}")),
+        fields,
+        related,
+    })
+}
+
+fn function_detail(model: &Model, function_index: usize) -> Option<EntityDetail> {
+    let function = model.functions.get(function_index)?;
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "name".to_owned(),
+        model.strings.get(function.name).to_owned(),
+    );
+    if let Some(domain) = function.domain {
+        fields.insert("domain".to_owned(), model.strings.get(domain).to_owned());
+    }
+    if let Some(overload) = function.overload {
+        fields.insert(
+            "overload".to_owned(),
+            model.strings.get(overload).to_owned(),
+        );
+    }
+    fields.insert("input_count".to_owned(), function.inputs.len().to_string());
+    fields.insert(
+        "output_count".to_owned(),
+        function.outputs.len().to_string(),
+    );
+    fields.insert(
+        "attribute_count".to_owned(),
+        function.attributes.len().to_string(),
+    );
+    fields.insert("value_count".to_owned(), function.values.len().to_string());
+    fields.insert("node_count".to_owned(), function.nodes.len().to_string());
+    fields.insert("opset_count".to_owned(), function.opsets.len().to_string());
+    add_metadata_fields(&mut fields, &function.metadata);
+
+    Some(EntityDetail {
+        handle: EntityHandle::Function {
+            function: function_index,
+        },
+        title: model.strings.get(function.name).to_owned(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn metadata_detail(model: &Model, owner: &str, key: &str) -> Option<EntityDetail> {
+    if owner != "model" {
+        return None;
+    }
+    let value = model.metadata.properties.get(key)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("owner".to_owned(), owner.to_owned());
+    fields.insert("key".to_owned(), key.to_owned());
+    fields.insert("value".to_owned(), value.clone());
+    Some(EntityDetail {
+        handle: EntityHandle::Metadata {
+            owner: owner.to_owned(),
+            key: key.to_owned(),
+        },
+        title: key.to_owned(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn opset_detail(model: &Model, domain: Option<&str>, version: i64) -> Option<EntityDetail> {
+    model
+        .metadata
+        .opsets
+        .iter()
+        .find(|opset| opset.version == version && opset.domain.as_deref() == domain)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("domain".to_owned(), domain.unwrap_or("default").to_owned());
+    fields.insert("version".to_owned(), version.to_string());
+    Some(EntityDetail {
+        handle: EntityHandle::OperatorSet {
+            domain: domain.map(str::to_owned),
+            version,
+        },
+        title: domain.unwrap_or("default").to_owned(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn diagnostic_detail(index: &OnnxIndex, diagnostic_index: usize) -> Option<EntityDetail> {
+    let diagnostic = index.diagnostics.get(diagnostic_index)?;
+    let handle = EntityHandle::Diagnostic {
+        diagnostic: diagnostic_index,
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("code".to_owned(), diagnostic.code.to_owned());
+    fields.insert(
+        "kind".to_owned(),
+        diagnostic_kind_name(diagnostic.kind).to_owned(),
+    );
+    fields.insert("message".to_owned(), diagnostic.message.clone());
+    if let Some(source) = &diagnostic.source {
+        fields.insert("source".to_owned(), source.clone());
+    }
+    Some(EntityDetail {
+        handle,
+        title: diagnostic.code.to_owned(),
+        fields,
+        related: Vec::new(),
+    })
+}
+
+fn diagnostic_kind_name(kind: DiagnosticKind) -> &'static str {
+    match kind {
+        DiagnosticKind::Info => "info",
+        DiagnosticKind::Warning => "warning",
+        DiagnosticKind::Error => "error",
+    }
+}
+
+fn add_type_fields(
+    model: &Model,
+    fields: &mut BTreeMap<String, String>,
+    element_type: Option<&TensorElementType>,
+    shape: &[Dimension],
+) {
+    if let Some(element_type) = element_type {
+        fields.insert("element_type".to_owned(), element_type_name(element_type));
+    }
+    fields.insert("rank".to_owned(), shape.len().to_string());
+    fields.insert(
+        "shape".to_owned(),
+        shape
+            .iter()
+            .map(|dimension| dimension_label(model, &dimension.value))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+}
+
+fn add_metadata_fields(fields: &mut BTreeMap<String, String>, metadata: &BTreeMap<String, String>) {
+    for (key, value) in metadata {
+        fields.insert(format!("metadata.{key}"), value.clone());
+    }
+}
+
+fn push_related(related: &mut Vec<EntityHandle>, limit: usize, handle: EntityHandle) {
+    if related.len() < limit {
+        related.push(handle);
+    }
+}
+
+fn tensor_storage_kind_name(kind: TensorStorageKind) -> &'static str {
+    match kind {
+        TensorStorageKind::Absent => "absent",
+        TensorStorageKind::InlineBytes => "inline_bytes",
+        TensorStorageKind::ElementList => "element_list",
+        TensorStorageKind::External => "external",
+        TensorStorageKind::Sparse => "sparse",
+    }
+}
+
 fn search_index_entries(entries: &[SearchEntry], query: &str, limit: usize) -> Vec<SearchEntry> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() || limit == 0 {
@@ -754,7 +1415,8 @@ impl ModelSession {
         &self.index
     }
 
-    pub fn summary(&self, _limits: &SessionLimits) -> SessionSummary {
+    pub fn summary(&self, limits: &SessionLimits) -> SessionSummary {
+        let detail_limit = limits.clamp().detail;
         let initializers = initializer_count(&self.model);
         let subgraphs = subgraph_count(&self.model);
         let sparse_tensors = sparse_tensor_count(&self.model);
@@ -778,12 +1440,25 @@ impl ModelSession {
                 opsets: index
                     .opsets
                     .iter()
+                    .take(detail_limit)
                     .map(|opset| OnnxOperatorSet {
                         domain: opset.domain.clone(),
                         version: opset.version,
                     })
                     .collect(),
-                metadata_keys: index.metadata_keys.clone(),
+                metadata_keys: index
+                    .metadata_keys
+                    .iter()
+                    .take(detail_limit)
+                    .cloned()
+                    .collect(),
+                graph_summaries: index
+                    .graph_summaries
+                    .iter()
+                    .take(detail_limit)
+                    .cloned()
+                    .collect(),
+                histograms: limit_histograms(&index.histograms, detail_limit),
             }),
             _ => None,
         };
@@ -841,6 +1516,11 @@ impl ModelSession {
     pub fn tensor_metadata(&self, limits: &SessionLimits) -> Vec<TensorMetadata> {
         self.index.tensor_metadata(limits.clamp().detail)
     }
+
+    pub fn detail(&self, handle: &EntityHandle, limits: &SessionLimits) -> Option<EntityDetail> {
+        self.index
+            .detail(&self.model, handle, limits.clamp().detail)
+    }
 }
 
 impl FormatIndex {
@@ -880,6 +1560,18 @@ impl FormatIndex {
         match self {
             Self::Onnx(index) => index.tensor_metadata(limit),
             Self::Mlir(_) | Self::Unknown(_) => Vec::new(),
+        }
+    }
+
+    pub fn detail(
+        &self,
+        model: &Model,
+        handle: &EntityHandle,
+        limit: usize,
+    ) -> Option<EntityDetail> {
+        match self {
+            Self::Onnx(index) => index.detail(model, handle, limit),
+            Self::Mlir(_) | Self::Unknown(_) => None,
         }
     }
 }
@@ -1353,6 +2045,27 @@ mod tests {
         assert_eq!(onnx.opsets.len(), 1);
         assert_eq!(onnx.opsets[0].domain.as_deref(), Some("ai.onnx"));
         assert_eq!(onnx.metadata_keys, vec!["global_meta".to_owned()]);
+        assert_eq!(onnx.graph_summaries[0].node_count, 1);
+        assert_eq!(onnx.graph_summaries[0].tensor_count, 1);
+        assert_eq!(histogram_count(&onnx.histograms.graph_node_counts, "1"), 1);
+        assert_eq!(histogram_count(&onnx.histograms.graph_value_counts, "3"), 1);
+        assert_eq!(
+            histogram_count(&onnx.histograms.graph_tensor_counts, "1"),
+            1
+        );
+        assert_eq!(
+            histogram_count(&onnx.histograms.operator_types, "MyNode"),
+            1
+        );
+        assert_eq!(histogram_count(&onnx.histograms.operator_types, "FnOp"), 1);
+        assert_eq!(histogram_count(&onnx.histograms.domains, "custom"), 1);
+        assert_eq!(histogram_count(&onnx.histograms.dtypes, "float32"), 3);
+        assert_eq!(
+            histogram_count(&onnx.histograms.storage_kinds, "external"),
+            1
+        );
+        assert_eq!(histogram_count(&onnx.histograms.shape_ranks, "0"), 3);
+        assert_eq!(histogram_count(&onnx.histograms.fan_in, "1"), 2);
     }
 
     #[test]
@@ -1435,6 +2148,59 @@ mod tests {
     }
 
     #[test]
+    fn onnx_detail_returns_selected_entity_fields() {
+        let model = fixture_onnx_model();
+        let session = ModelSession {
+            id: 103,
+            source: ModelSource::from_memory(Some("model.onnx".to_owned()), 0),
+            index: FormatIndex::build(&model),
+            model,
+        };
+
+        let node = session
+            .detail(
+                &EntityHandle::Node { graph: 0, node: 0 },
+                &SessionLimits::default(),
+            )
+            .expect("node detail");
+        assert_eq!(node.title, "node_main");
+        assert_eq!(
+            node.fields.get("domain").map(String::as_str),
+            Some("custom")
+        );
+        assert!(
+            node.related
+                .iter()
+                .any(|handle| handle == &EntityHandle::Value { graph: 0, value: 0 })
+        );
+
+        let tensor = session
+            .detail(
+                &EntityHandle::Tensor { tensor: 1 },
+                &SessionLimits::default(),
+            )
+            .expect("tensor detail");
+        assert_eq!(
+            tensor.fields.get("external.location").map(String::as_str),
+            Some("weights.bin")
+        );
+
+        let metadata = session
+            .detail(
+                &EntityHandle::Metadata {
+                    owner: "model".to_owned(),
+                    key: "global_meta".to_owned(),
+                },
+                &SessionLimits::default(),
+            )
+            .expect("metadata detail");
+        assert_eq!(
+            metadata.fields.get("value").map(String::as_str),
+            Some("present")
+        );
+    }
+
+    #[test]
     fn onnx_diagnostics_report_unsupported_attributes() {
         let model = fixture_onnx_model();
         let session = ModelSession {
@@ -1450,6 +2216,22 @@ mod tests {
             diagnostics
                 .iter()
                 .all(|item| item.code == "onnx.unsupported_attribute")
+        );
+        assert!(matches!(
+            diagnostics[0].handle.as_ref(),
+            Some(EntityHandle::Diagnostic { diagnostic: 0 })
+        ));
+
+        let detail = session
+            .detail(
+                &EntityHandle::Diagnostic { diagnostic: 0 },
+                &SessionLimits::default(),
+            )
+            .expect("diagnostic detail");
+        assert_eq!(detail.title, "onnx.unsupported_attribute");
+        assert_eq!(
+            detail.fields.get("kind").map(String::as_str),
+            Some("warning")
         );
     }
 
@@ -1483,6 +2265,14 @@ mod tests {
         graph.values[input.index()].consumers.push(node_id);
         model.replace_graph(graph_id, graph);
         model
+    }
+
+    fn histogram_count(entries: &[HistogramEntry], key: &str) -> usize {
+        entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
     }
 
     fn fixture_onnx_model() -> netron_rs_core::Model {
