@@ -71,6 +71,8 @@ fn search_reports_bounded_query_hits() {
     let hits: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(hits.as_array().unwrap().len(), 1);
     assert_eq!(hits[0]["kind"], "node");
+    assert_eq!(hits[0]["handle"]["kind"], "node");
+    assert_eq!(hits[0]["handle"]["graph"], 0);
     assert_eq!(hits[0]["operator"], "Add");
     assert_eq!(hits[0]["graph"], 0);
 }
@@ -94,6 +96,8 @@ fn summary_reports_indexed_session_info() {
     assert_eq!(summary["graphs"], 1);
     assert_eq!(summary["nodes"], 1);
     assert_eq!(summary["tensors"], 1);
+    assert_eq!(summary["opsets"], 1);
+    assert_eq!(summary["onnx"]["opsets"][0]["version"], 18);
     assert_eq!(summary["source"]["kind"]["kind"], "file");
     assert!(
         summary["source"]["content_identity"]

@@ -65,11 +65,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Search { path, query, limit } => {
             let mapped = MappedModel::open(&path)?;
-            let model = netron_rs_formats::parse(mapped.input())?;
-            let index = netron_rs_query::ModelIndex::build(&model);
+            let session = ModelSession::open(mapped.bytes(), mapped.source())?;
+            let limits = SessionLimits {
+                search: limit,
+                ..SessionLimits::default()
+            };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&index.search(&query, limit))?
+                serde_json::to_string_pretty(&session.search(&query, &limits))?
             );
         }
     }

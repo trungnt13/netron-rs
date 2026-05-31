@@ -1,7 +1,13 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use netron_rs_core::{Model, ModelError, ModelInput, TensorStorage};
+use netron_rs_core::{
+    AttributeValue, DimensionValue, Model, ModelError, ModelInput, Tensor, TensorElementType,
+    TensorStorage,
+};
 use serde::Serialize;
 
 pub const SESSION_API_VERSION: u32 = 1;
@@ -14,11 +20,14 @@ pub enum SearchKind {
     Value,
     Tensor,
     Function,
+    Metadata,
+    OperatorSet,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchEntry {
     pub kind: SearchKind,
+    pub handle: EntityHandle,
     pub graph: Option<usize>,
     pub id: usize,
     pub name: Option<String>,
@@ -28,14 +37,34 @@ pub struct SearchEntry {
     searchable: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntityHandle {
-    Graph { graph: usize },
-    Node { graph: usize, node: usize },
-    Value { graph: usize, value: usize },
-    Tensor { tensor: usize },
-    Function { function: usize },
+    Graph {
+        graph: usize,
+    },
+    Node {
+        graph: usize,
+        node: usize,
+    },
+    Value {
+        graph: usize,
+        value: usize,
+    },
+    Tensor {
+        tensor: usize,
+    },
+    Function {
+        function: usize,
+    },
+    Metadata {
+        owner: String,
+        key: String,
+    },
+    OperatorSet {
+        domain: Option<String>,
+        version: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -48,7 +77,7 @@ pub enum FormatKind {
 
 #[derive(Debug, Clone)]
 pub enum FormatIndex {
-    Onnx(ModelIndex),
+    Onnx(OnnxIndex),
     Mlir(ModelIndex),
     Unknown(ModelIndex),
 }
@@ -99,8 +128,15 @@ pub struct SessionSummary {
     pub nodes: usize,
     pub values: usize,
     pub tensors: usize,
+    pub initializers: usize,
+    pub subgraphs: usize,
+    pub sparse_tensors: usize,
+    pub metadata: usize,
+    pub opsets: usize,
     pub external_data: usize,
     pub mlir_resources: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onnx: Option<OnnxSummary>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -121,6 +157,562 @@ pub struct Diagnostic {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct OnnxSummary {
+    pub producer: Option<String>,
+    pub producer_version: Option<String>,
+    pub model_domain: Option<String>,
+    pub model_version: Option<i64>,
+    pub description: Option<String>,
+    pub graph_count: usize,
+    pub function_count: usize,
+    pub node_count: usize,
+    pub value_count: usize,
+    pub tensor_count: usize,
+    pub initializer_count: usize,
+    pub subgraph_count: usize,
+    pub sparse_tensor_count: usize,
+    pub opsets: Vec<OnnxOperatorSet>,
+    pub metadata_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OnnxOperatorSet {
+    pub domain: Option<String>,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TensorMetadata {
+    pub handle: EntityHandle,
+    pub name: Option<String>,
+    pub element_type: String,
+    pub shape: Vec<String>,
+    pub storage: TensorStorageKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_count: Option<usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub external_data: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_values: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_indices: Option<usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TensorStorageKind {
+    Absent,
+    InlineBytes,
+    ElementList,
+    External,
+    Sparse,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnnxIndex {
+    entries: Vec<SearchEntry>,
+    tensor_metadata: Vec<TensorMetadata>,
+    graph_count: usize,
+    function_count: usize,
+    node_count: usize,
+    value_count: usize,
+    tensor_count: usize,
+    initializer_count: usize,
+    subgraph_count: usize,
+    sparse_tensor_count: usize,
+    metadata_keys: Vec<String>,
+    opsets: Vec<OnnxOperatorSet>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl OnnxIndex {
+    pub fn build(model: &Model) -> Self {
+        let mut entries = Vec::new();
+        let metadata_keys = model
+            .metadata
+            .properties
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, (key, value)) in model.metadata.properties.iter().enumerate() {
+            entries.push(SearchEntry::new_with_handle_and_search_terms(
+                SearchKind::Metadata,
+                EntityHandle::Metadata {
+                    owner: "model".to_owned(),
+                    key: key.clone(),
+                },
+                None,
+                index,
+                Some(key.clone()),
+                None,
+                Some("onnx_metadata"),
+                [value.clone()],
+            ));
+        }
+        for (index, opset) in model.metadata.opsets.iter().enumerate() {
+            let domain = opset.domain.clone();
+            entries.push(SearchEntry::new_with_handle_and_search_terms(
+                SearchKind::OperatorSet,
+                EntityHandle::OperatorSet {
+                    domain: domain.clone(),
+                    version: opset.version,
+                },
+                None,
+                index,
+                domain.clone().or_else(|| Some("default".to_owned())),
+                None,
+                Some("onnx_opset"),
+                [domain.unwrap_or_default(), opset.version.to_string()],
+            ));
+        }
+
+        let mut node_count = 0;
+        let mut value_count = 0;
+        let tensor_count = model.tensors.len();
+        let mut subgraph_count = 0;
+        let mut diagnostics = Vec::new();
+
+        for (graph_index, graph) in model.graphs.iter().enumerate() {
+            let graph_name = graph.name.map(|id| model.strings.get(id).to_owned());
+            let mut graph_terms = searchable_terms(graph_name.clone(), &graph.metadata);
+            graph_terms.extend(model.metadata.properties.keys().cloned());
+            graph_terms.extend(model.metadata.properties.values().cloned());
+            entries.push(SearchEntry::new_with_search_terms(
+                SearchKind::Graph,
+                Some(graph_index),
+                graph_index,
+                graph_name,
+                None,
+                None,
+                graph_terms,
+            ));
+
+            subgraph_count += graph.subgraphs.len();
+
+            for node in &graph.nodes {
+                node_count += 1;
+
+                let name = node.name.map(|id| model.strings.get(id).to_owned());
+                let operator = Some(model.strings.get(node.operator.name).to_owned());
+                let mut search_terms = searchable_terms(name.clone(), &node.metadata);
+
+                if let Some(domain) = node.operator.domain {
+                    search_terms.push(model.strings.get(domain).to_owned());
+                }
+
+                if node
+                    .outputs
+                    .iter()
+                    .flatten()
+                    .any(|value| graph.values[value.index()].initializer.is_some())
+                {
+                    search_terms.push("initializer".to_string());
+                }
+
+                for attribute in &node.attributes {
+                    if let Some(diagnostic) = attribute_diagnostic(
+                        "graph node",
+                        graph_index,
+                        node.id.index(),
+                        Some(model.strings.get(attribute.name)),
+                        &attribute.value,
+                    ) {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+
+                entries.push(SearchEntry::new_with_search_terms(
+                    SearchKind::Node,
+                    Some(graph_index),
+                    node.id.index(),
+                    name,
+                    operator,
+                    Some(node.operator.origin),
+                    search_terms,
+                ));
+            }
+
+            for value in &graph.values {
+                value_count += 1;
+
+                let mut search_terms = searchable_terms(
+                    Some(model.strings.get(value.name).to_owned()),
+                    &value.metadata,
+                );
+                if value.initializer.is_some() {
+                    search_terms.push("initializer".to_string());
+                }
+                entries.push(SearchEntry::new_with_search_terms(
+                    SearchKind::Value,
+                    Some(graph_index),
+                    value.id.index(),
+                    Some(model.strings.get(value.name).to_owned()),
+                    None,
+                    None,
+                    search_terms,
+                ));
+            }
+        }
+
+        for tensor in &model.tensors {
+            let mut search_terms = searchable_terms(
+                tensor.name.map(|id| model.strings.get(id).to_owned()),
+                &tensor.metadata,
+            );
+
+            match &tensor.storage {
+                netron_rs_core::TensorStorage::External { entries } => {
+                    for (key, value) in entries {
+                        search_terms.push(key.to_owned());
+                        search_terms.push(value.to_owned());
+                    }
+                    search_terms.push("external".to_owned());
+                    search_terms.push("external_data".to_owned());
+                }
+                netron_rs_core::TensorStorage::Sparse { .. } => {
+                    search_terms.push("sparse".to_owned());
+                }
+                _ => {}
+            }
+
+            entries.push(SearchEntry::new_with_search_terms(
+                SearchKind::Tensor,
+                None,
+                tensor.id.index(),
+                tensor.name.map(|id| model.strings.get(id).to_owned()),
+                None,
+                None,
+                search_terms,
+            ));
+        }
+
+        for (index, function) in model.functions.iter().enumerate() {
+            let mut search_terms = vec![model.strings.get(function.name).to_owned()];
+            if let Some(domain) = function.domain {
+                search_terms.push(model.strings.get(domain).to_owned());
+            }
+            if let Some(overload) = function.overload {
+                search_terms.push(model.strings.get(overload).to_owned());
+            }
+            search_terms.extend(function.metadata.keys().cloned());
+            search_terms.extend(function.metadata.values().cloned());
+            search_terms.extend(
+                function
+                    .outputs
+                    .iter()
+                    .chain(&function.inputs)
+                    .chain(&function.attributes)
+                    .map(|name| model.strings.get(*name).to_owned()),
+            );
+
+            for value in &function.values {
+                if value.initializer.is_some() {
+                    search_terms.push("initializer".to_owned());
+                }
+            }
+
+            for (node_index, node) in function.nodes.iter().enumerate() {
+                search_terms.extend(node.metadata.keys().cloned());
+                search_terms.extend(node.metadata.values().cloned());
+                search_terms.push(model.strings.get(node.operator.name).to_owned());
+                if let Some(domain) = node.operator.domain {
+                    search_terms.push(model.strings.get(domain).to_owned());
+                }
+                if let Some(overload) = node.operator.overload {
+                    search_terms.push(model.strings.get(overload).to_owned());
+                }
+                for attribute in &node.attributes {
+                    if let Some(diagnostic) = attribute_diagnostic(
+                        "function node",
+                        index,
+                        node_index,
+                        Some(model.strings.get(attribute.name)),
+                        &attribute.value,
+                    ) {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+            }
+
+            entries.push(SearchEntry::new_with_search_terms(
+                SearchKind::Function,
+                None,
+                index,
+                Some(model.strings.get(function.name).to_owned()),
+                None,
+                None,
+                search_terms,
+            ));
+        }
+
+        let graph_count = model.graphs.len();
+        let function_count = model.functions.len();
+        let initializer_count = initializer_count(model);
+        let sparse_tensor_count = sparse_tensor_count(model);
+        let tensor_metadata = tensor_metadata(model);
+        let opsets = model
+            .metadata
+            .opsets
+            .iter()
+            .map(|entry| OnnxOperatorSet {
+                domain: entry.domain.clone(),
+                version: entry.version,
+            })
+            .collect();
+
+        Self {
+            entries,
+            tensor_metadata,
+            graph_count,
+            function_count,
+            node_count,
+            value_count,
+            tensor_count,
+            initializer_count,
+            subgraph_count,
+            sparse_tensor_count,
+            metadata_keys,
+            opsets,
+            diagnostics,
+        }
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Vec<SearchEntry> {
+        search_index_entries(&self.entries, query, limit)
+    }
+
+    pub fn tensor_metadata(&self, limit: usize) -> Vec<TensorMetadata> {
+        self.tensor_metadata.iter().take(limit).cloned().collect()
+    }
+}
+
+fn attribute_diagnostic(
+    scope: &str,
+    graph: usize,
+    node: usize,
+    name: Option<&str>,
+    value: &AttributeValue,
+) -> Option<Diagnostic> {
+    match value {
+        AttributeValue::Unsupported(message) => Some(Diagnostic {
+            kind: DiagnosticKind::Warning,
+            code: "onnx.unsupported_attribute",
+            message: format!(
+                "Unsupported attribute value for {scope} {graph}/{node} {name:?}: {message}"
+            ),
+            source: None,
+        }),
+        _ => None,
+    }
+}
+
+fn searchable_terms(name: Option<String>, metadata: &BTreeMap<String, String>) -> Vec<String> {
+    let mut search = Vec::new();
+    if let Some(name) = name {
+        search.push(name);
+    }
+    search.extend(metadata.keys().cloned());
+    search.extend(metadata.values().cloned());
+    search
+}
+
+fn tensor_metadata(model: &Model) -> Vec<TensorMetadata> {
+    model
+        .tensors
+        .iter()
+        .map(|tensor| tensor_metadata_entry(model, tensor))
+        .collect()
+}
+
+fn tensor_metadata_entry(model: &Model, tensor: &Tensor) -> TensorMetadata {
+    let (storage, byte_len, element_count, external_data, sparse_values, sparse_indices) =
+        match &tensor.storage {
+            TensorStorage::Absent => (
+                TensorStorageKind::Absent,
+                None,
+                None,
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+            TensorStorage::InlineBytes { byte_len } => (
+                TensorStorageKind::InlineBytes,
+                Some(*byte_len),
+                None,
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+            TensorStorage::ElementList { len } => (
+                TensorStorageKind::ElementList,
+                None,
+                Some(*len),
+                BTreeMap::new(),
+                None,
+                None,
+            ),
+            TensorStorage::External { entries } => (
+                TensorStorageKind::External,
+                None,
+                None,
+                entries.clone(),
+                None,
+                None,
+            ),
+            TensorStorage::Sparse { values, indices } => (
+                TensorStorageKind::Sparse,
+                None,
+                None,
+                BTreeMap::new(),
+                Some(values.index()),
+                Some(indices.index()),
+            ),
+        };
+
+    TensorMetadata {
+        handle: EntityHandle::Tensor {
+            tensor: tensor.id.index(),
+        },
+        name: tensor.name.map(|id| model.strings.get(id).to_owned()),
+        element_type: element_type_name(&tensor.element_type),
+        shape: tensor
+            .shape
+            .iter()
+            .map(|dimension| dimension_label(model, &dimension.value))
+            .collect(),
+        storage,
+        byte_len,
+        element_count,
+        external_data,
+        sparse_values,
+        sparse_indices,
+        metadata: tensor.metadata.clone(),
+    }
+}
+
+fn element_type_name(element_type: &TensorElementType) -> String {
+    match element_type {
+        TensorElementType::Other(value) => value.clone(),
+        _ => format!("{element_type:?}").to_ascii_lowercase(),
+    }
+}
+
+fn dimension_label(model: &Model, value: &DimensionValue) -> String {
+    match value {
+        DimensionValue::Known(value) => value.to_string(),
+        DimensionValue::Symbolic(value) => model.strings.get(*value).to_owned(),
+        DimensionValue::Unknown => "?".to_owned(),
+    }
+}
+
+fn initializer_count(model: &Model) -> usize {
+    model
+        .graphs
+        .iter()
+        .map(|graph| {
+            graph
+                .values
+                .iter()
+                .filter(|value| value.initializer.is_some())
+                .count()
+        })
+        .sum::<usize>()
+        + model
+            .functions
+            .iter()
+            .map(|function| {
+                function
+                    .values
+                    .iter()
+                    .filter(|value| value.initializer.is_some())
+                    .count()
+            })
+            .sum::<usize>()
+}
+
+fn subgraph_count(model: &Model) -> usize {
+    model.graphs.iter().map(|graph| graph.subgraphs.len()).sum()
+}
+
+fn sparse_tensor_count(model: &Model) -> usize {
+    model
+        .tensors
+        .iter()
+        .filter(|tensor| matches!(tensor.storage, TensorStorage::Sparse { .. }))
+        .count()
+}
+
+fn metadata_count(model: &Model) -> usize {
+    model.metadata.properties.len()
+        + model
+            .graphs
+            .iter()
+            .map(|graph| {
+                graph.metadata.len()
+                    + graph
+                        .nodes
+                        .iter()
+                        .map(|node| node.metadata.len())
+                        .sum::<usize>()
+                    + graph
+                        .values
+                        .iter()
+                        .map(|value| value.metadata.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+        + model
+            .functions
+            .iter()
+            .map(|function| {
+                function.metadata.len()
+                    + function
+                        .nodes
+                        .iter()
+                        .map(|node| node.metadata.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+        + model
+            .tensors
+            .iter()
+            .map(|tensor| tensor.metadata.len())
+            .sum::<usize>()
+}
+
+fn opset_count(model: &Model) -> usize {
+    model.metadata.opsets.len()
+        + model
+            .functions
+            .iter()
+            .map(|function| function.opsets.len())
+            .sum::<usize>()
+}
+
+fn search_index_entries(entries: &[SearchEntry], query: &str, limit: usize) -> Vec<SearchEntry> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut matches = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry.score(&needle).map(|score| (score, index)))
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.truncate(limit);
+    matches
+        .into_iter()
+        .map(|(_, index)| entries[index].clone())
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticsResponse {
     pub api_version: u32,
     pub session_id: u64,
@@ -134,7 +726,6 @@ pub struct ModelSession {
     source: ModelSource,
     index: FormatIndex,
     model: Model,
-    diagnostics: Vec<Diagnostic>,
 }
 
 impl ModelSession {
@@ -148,7 +739,6 @@ impl ModelSession {
             source,
             index,
             model,
-            diagnostics: Vec::new(),
         })
     }
 
@@ -165,6 +755,39 @@ impl ModelSession {
     }
 
     pub fn summary(&self, _limits: &SessionLimits) -> SessionSummary {
+        let initializers = initializer_count(&self.model);
+        let subgraphs = subgraph_count(&self.model);
+        let sparse_tensors = sparse_tensor_count(&self.model);
+        let metadata = metadata_count(&self.model);
+        let opsets = opset_count(&self.model);
+        let onnx = match &self.index {
+            FormatIndex::Onnx(index) => Some(OnnxSummary {
+                producer: self.model.metadata.producer.clone(),
+                producer_version: self.model.metadata.producer_version.clone(),
+                model_domain: self.model.metadata.domain.clone(),
+                model_version: self.model.metadata.model_version,
+                description: self.model.metadata.description.clone(),
+                graph_count: index.graph_count,
+                function_count: index.function_count,
+                node_count: index.node_count,
+                value_count: index.value_count,
+                tensor_count: index.tensor_count,
+                initializer_count: index.initializer_count,
+                subgraph_count: index.subgraph_count,
+                sparse_tensor_count: index.sparse_tensor_count,
+                opsets: index
+                    .opsets
+                    .iter()
+                    .map(|opset| OnnxOperatorSet {
+                        domain: opset.domain.clone(),
+                        version: opset.version,
+                    })
+                    .collect(),
+                metadata_keys: index.metadata_keys.clone(),
+            }),
+            _ => None,
+        };
+
         SessionSummary {
             api_version: SESSION_API_VERSION,
             session_id: self.id,
@@ -187,14 +810,20 @@ impl ModelSession {
                 .map(|graph| graph.values.len())
                 .sum(),
             tensors: self.model.tensors.len(),
+            initializers,
+            subgraphs,
+            sparse_tensors,
+            metadata,
+            opsets,
             external_data: external_data_count(&self.model),
             mlir_resources: mlir_resource_count(&self.model),
+            onnx,
         }
     }
 
     pub fn diagnostics(&self, limits: &SessionLimits) -> DiagnosticsResponse {
         let limit = limits.clamp().diagnostics;
-        let mut diagnostics = self.diagnostics.clone();
+        let mut diagnostics = self.index.diagnostics().to_vec();
         let truncated = diagnostics.len() > limit;
         diagnostics.truncate(limit);
         DiagnosticsResponse {
@@ -208,15 +837,26 @@ impl ModelSession {
     pub fn search(&self, query: &str, limits: &SessionLimits) -> Vec<SearchEntry> {
         self.index.search(query, limits.clamp().search)
     }
+
+    pub fn tensor_metadata(&self, limits: &SessionLimits) -> Vec<TensorMetadata> {
+        self.index.tensor_metadata(limits.clamp().detail)
+    }
 }
 
 impl FormatIndex {
     fn build(model: &Model) -> Self {
-        let index = ModelIndex::build(model);
         match model.format.name {
-            "ONNX" | "ONNX Tensor" => Self::Onnx(index),
-            "MLIR" => Self::Mlir(index),
-            _ => Self::Unknown(index),
+            "ONNX" | "ONNX Tensor" => Self::Onnx(OnnxIndex::build(model)),
+            "MLIR" => Self::Mlir(ModelIndex::build(model)),
+            _ => Self::Unknown(ModelIndex::build(model)),
+        }
+    }
+
+    fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::Onnx(index) => &index.diagnostics,
+            Self::Mlir(index) => &index.diagnostics,
+            Self::Unknown(index) => &index.diagnostics,
         }
     }
 
@@ -230,9 +870,16 @@ impl FormatIndex {
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchEntry> {
         match self {
-            Self::Onnx(index) | Self::Mlir(index) | Self::Unknown(index) => {
-                index.search(query, limit)
-            }
+            Self::Onnx(index) => index.search(query, limit),
+            Self::Mlir(index) => index.search(query, limit),
+            Self::Unknown(index) => index.search(query, limit),
+        }
+    }
+
+    pub fn tensor_metadata(&self, limit: usize) -> Vec<TensorMetadata> {
+        match self {
+            Self::Onnx(index) => index.tensor_metadata(limit),
+            Self::Mlir(_) | Self::Unknown(_) => Vec::new(),
         }
     }
 }
@@ -328,6 +975,7 @@ impl SessionLimits {
 #[derive(Debug, Clone)]
 pub struct ModelIndex {
     entries: Vec<SearchEntry>,
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl ModelIndex {
@@ -392,7 +1040,10 @@ impl ModelIndex {
             ));
         }
 
-        Self { entries }
+        Self {
+            entries,
+            diagnostics: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -404,23 +1055,7 @@ impl ModelIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchEntry> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-
-        let mut matches = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| entry.score(&needle).map(|score| (score, index)))
-            .collect::<Vec<_>>();
-        matches.sort_unstable();
-        matches.truncate(limit);
-        matches
-            .into_iter()
-            .map(|(_, index)| self.entries[index].clone())
-            .collect()
+        search_index_entries(&self.entries, query, limit)
     }
 }
 
@@ -433,37 +1068,85 @@ impl SearchEntry {
         operator: Option<String>,
         origin: Option<&'static str>,
     ) -> Self {
-        let searchable = [name.as_deref(), operator.as_deref(), origin]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        Self {
+        Self::new_with_search_terms(
             kind,
             graph,
             id,
             name,
             operator,
             origin,
-            searchable,
+            Vec::<String>::new(),
+        )
+    }
+
+    fn new_with_search_terms<I: IntoIterator<Item = String>>(
+        kind: SearchKind,
+        graph: Option<usize>,
+        id: usize,
+        name: Option<String>,
+        operator: Option<String>,
+        origin: Option<&'static str>,
+        searchable_terms: I,
+    ) -> Self {
+        Self::new_with_handle_and_search_terms(
+            kind,
+            default_handle(kind, graph, id),
+            graph,
+            id,
+            name,
+            operator,
+            origin,
+            searchable_terms,
+        )
+    }
+
+    fn new_with_handle_and_search_terms<I: IntoIterator<Item = String>>(
+        kind: SearchKind,
+        handle: EntityHandle,
+        graph: Option<usize>,
+        id: usize,
+        name: Option<String>,
+        operator: Option<String>,
+        origin: Option<&'static str>,
+        searchable_terms: I,
+    ) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut searchable = Vec::new();
+
+        for entry in [name.as_deref(), operator.as_deref(), origin]
+            .into_iter()
+            .flatten()
+        {
+            let value = entry.to_lowercase();
+            if seen.insert(value.clone()) {
+                searchable.push(value);
+            }
+        }
+
+        for entry in searchable_terms {
+            let value = entry.trim().to_lowercase();
+            if value.is_empty() {
+                continue;
+            }
+            if seen.insert(value.clone()) {
+                searchable.push(value);
+            }
+        }
+
+        Self {
+            kind,
+            handle,
+            graph,
+            id,
+            name,
+            operator,
+            origin,
+            searchable: searchable.join(" "),
         }
     }
 
     pub fn handle(&self) -> EntityHandle {
-        match self.kind {
-            SearchKind::Graph => EntityHandle::Graph { graph: self.id },
-            SearchKind::Node => EntityHandle::Node {
-                graph: self.graph.unwrap_or(0),
-                node: self.id,
-            },
-            SearchKind::Value => EntityHandle::Value {
-                graph: self.graph.unwrap_or(0),
-                value: self.id,
-            },
-            SearchKind::Tensor => EntityHandle::Tensor { tensor: self.id },
-            SearchKind::Function => EntityHandle::Function { function: self.id },
-        }
+        self.handle.clone()
     }
 
     fn score(&self, needle: &str) -> Option<u8> {
@@ -474,6 +1157,30 @@ impl SearchEntry {
             score = min_score(score, Some(9));
         }
         score
+    }
+}
+
+fn default_handle(kind: SearchKind, graph: Option<usize>, id: usize) -> EntityHandle {
+    match kind {
+        SearchKind::Graph => EntityHandle::Graph { graph: id },
+        SearchKind::Node => EntityHandle::Node {
+            graph: graph.unwrap_or(0),
+            node: id,
+        },
+        SearchKind::Value => EntityHandle::Value {
+            graph: graph.unwrap_or(0),
+            value: id,
+        },
+        SearchKind::Tensor => EntityHandle::Tensor { tensor: id },
+        SearchKind::Function => EntityHandle::Function { function: id },
+        SearchKind::Metadata => EntityHandle::Metadata {
+            owner: String::new(),
+            key: id.to_string(),
+        },
+        SearchKind::OperatorSet => EntityHandle::OperatorSet {
+            domain: None,
+            version: id as i64,
+        },
     }
 }
 
@@ -545,7 +1252,12 @@ fn min_score(left: Option<u8>, right: Option<u8>) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use netron_rs_core::{FormatInfo, Graph, Node, Operator, Value};
+    use std::collections::BTreeMap;
+
+    use netron_rs_core::{
+        Attribute, AttributeValue, FormatInfo, Function, FunctionNode, FunctionValue, Graph, Node,
+        Operator, Tensor, TensorElementType, TensorStorage, Value,
+    };
 
     use super::*;
 
@@ -609,6 +1321,138 @@ mod tests {
         assert_eq!(limits.diagnostics, SessionLimits::HARD_MAX.diagnostics);
     }
 
+    #[test]
+    fn onnx_summary_exposes_onnx_specific_counts() {
+        let model = fixture_onnx_model();
+        let session = ModelSession {
+            id: 99,
+            source: ModelSource::from_memory(Some("model.onnx".to_owned()), 0),
+            index: FormatIndex::build(&model),
+            model,
+        };
+
+        let summary = session.summary(&SessionLimits::default());
+        let onnx = summary
+            .onnx
+            .expect("onnx models should include onnx summary section");
+
+        assert_eq!(summary.format, FormatKind::Onnx);
+        assert_eq!(summary.initializers, 2);
+        assert_eq!(summary.sparse_tensors, 1);
+        assert_eq!(summary.opsets, 1);
+        assert_eq!(summary.external_data, 1);
+        assert_eq!(onnx.producer, Some("query-tests".to_owned()));
+        assert_eq!(onnx.graph_count, 1);
+        assert_eq!(onnx.function_count, 1);
+        assert_eq!(onnx.node_count, 1);
+        assert_eq!(onnx.value_count, 3);
+        assert_eq!(onnx.tensor_count, 3);
+        assert_eq!(onnx.initializer_count, 2);
+        assert_eq!(onnx.subgraph_count, 0);
+        assert_eq!(onnx.sparse_tensor_count, 1);
+        assert_eq!(onnx.opsets.len(), 1);
+        assert_eq!(onnx.opsets[0].domain.as_deref(), Some("ai.onnx"));
+        assert_eq!(onnx.metadata_keys, vec!["global_meta".to_owned()]);
+    }
+
+    #[test]
+    fn onnx_search_indexes_metadata_external_data_and_functions() {
+        let model = fixture_onnx_model();
+        let session = ModelSession {
+            id: 100,
+            source: ModelSource::from_memory(Some("model.onnx".to_owned()), 0),
+            index: FormatIndex::build(&model),
+            model,
+        };
+
+        let graph_hits = session.search("global_meta", &SessionLimits::default());
+        assert!(graph_hits.iter().any(|hit| hit.kind == SearchKind::Graph));
+        assert!(graph_hits.iter().any(|hit| {
+            matches!(
+                &hit.handle,
+                EntityHandle::Metadata { owner, key }
+                    if owner == "model" && key == "global_meta"
+            )
+        }));
+
+        let node_hits = session.search("node_meta_key", &SessionLimits::default());
+        assert!(node_hits.iter().any(|hit| hit.kind == SearchKind::Node));
+
+        let tensor_hits = session.search("weights.bin", &SessionLimits::default());
+        assert_eq!(tensor_hits.len(), 1);
+        assert_eq!(tensor_hits[0].kind, SearchKind::Tensor);
+        assert_eq!(tensor_hits[0].handle, EntityHandle::Tensor { tensor: 1 });
+
+        let function_hits = session.search("fn_attr", &SessionLimits::default());
+        assert!(
+            function_hits
+                .iter()
+                .any(|hit| hit.kind == SearchKind::Function)
+        );
+
+        let opset_hits = session.search("ai.onnx", &SessionLimits::default());
+        assert!(opset_hits.iter().any(|hit| {
+            matches!(
+                &hit.handle,
+                EntityHandle::OperatorSet {
+                    domain: Some(domain),
+                    version: 13
+                } if domain == "ai.onnx"
+            )
+        }));
+    }
+
+    #[test]
+    fn onnx_tensor_metadata_preserves_external_descriptors() {
+        let model = fixture_onnx_model();
+        let index = OnnxIndex::build(&model);
+        let tensors = index.tensor_metadata(10);
+        let external = tensors
+            .iter()
+            .find(|tensor| tensor.name.as_deref() == Some("external_weight"))
+            .expect("external tensor metadata");
+
+        assert_eq!(external.handle, EntityHandle::Tensor { tensor: 1 });
+        assert_eq!(external.storage, TensorStorageKind::External);
+        assert_eq!(
+            external.external_data.get("location").map(String::as_str),
+            Some("weights.bin")
+        );
+        assert_eq!(external.element_type, "float32");
+        assert_eq!(external.byte_len, None);
+
+        let session = ModelSession {
+            id: 102,
+            source: ModelSource::from_memory(Some("model.onnx".to_owned()), 0),
+            index: FormatIndex::Onnx(index),
+            model,
+        };
+        let bounded = session.tensor_metadata(&SessionLimits {
+            detail: 1,
+            ..SessionLimits::default()
+        });
+        assert_eq!(bounded.len(), 1);
+    }
+
+    #[test]
+    fn onnx_diagnostics_report_unsupported_attributes() {
+        let model = fixture_onnx_model();
+        let session = ModelSession {
+            id: 101,
+            source: ModelSource::from_memory(Some("model.onnx".to_owned()), 0),
+            index: FormatIndex::build(&model),
+            model,
+        };
+
+        let diagnostics = session.diagnostics(&SessionLimits::default()).diagnostics;
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.code == "onnx.unsupported_attribute")
+        );
+    }
+
     fn fixture_model() -> netron_rs_core::Model {
         let mut model = netron_rs_core::Model::new(FormatInfo {
             name: "test",
@@ -637,6 +1481,141 @@ mod tests {
         node.outputs.push(Some(exact));
         let node_id = graph.add_node(node);
         graph.values[input.index()].consumers.push(node_id);
+        model.replace_graph(graph_id, graph);
+        model
+    }
+
+    fn fixture_onnx_model() -> netron_rs_core::Model {
+        let mut model = netron_rs_core::Model::new(FormatInfo {
+            name: "ONNX",
+            version: None,
+        });
+
+        model.metadata.producer = Some("query-tests".to_owned());
+        model
+            .metadata
+            .properties
+            .insert("global_meta".to_owned(), "present".to_owned());
+        model.metadata.opsets.push(netron_rs_core::OperatorSet {
+            domain: Some("ai.onnx".to_owned()),
+            version: 13,
+        });
+
+        let inline_weight_name = model.intern("inline_weight");
+        let external_weight_name = model.intern("external_weight");
+        let sparse_weight_name = model.intern("sparse_weight");
+        let graph_name = model.intern("main");
+        let graph_id = model.add_graph_placeholder(None, Some(graph_name));
+
+        let inline_tensor_id = model.add_tensor(Tensor::metadata_only(
+            Some(inline_weight_name),
+            TensorElementType::Float32,
+            Vec::new(),
+            TensorStorage::InlineBytes { byte_len: 16 },
+        ));
+
+        let mut external_entries = BTreeMap::new();
+        external_entries.insert("location".to_owned(), "weights.bin".to_owned());
+        let external_tensor_id = model.add_tensor(Tensor::metadata_only(
+            Some(external_weight_name),
+            TensorElementType::Float32,
+            Vec::new(),
+            TensorStorage::External {
+                entries: external_entries,
+            },
+        ));
+
+        model.add_tensor(Tensor::metadata_only(
+            Some(sparse_weight_name),
+            TensorElementType::Float32,
+            Vec::new(),
+            TensorStorage::Sparse {
+                values: inline_tensor_id,
+                indices: inline_tensor_id,
+            },
+        ));
+
+        let mut graph = Graph::new(graph_id, None, Some(graph_name));
+        graph
+            .metadata
+            .insert("graph_meta".to_owned(), "present".to_owned());
+
+        let input = graph.add_value(Value::new(model.intern("input")));
+        let weight = graph.add_value(Value::new(model.intern("weight")));
+        let output = graph.add_value(Value::new(model.intern("output")));
+        graph.values[weight.index()].initializer = Some(external_tensor_id);
+        graph.values[weight.index()]
+            .metadata
+            .insert("value_meta".to_owned(), "set".to_owned());
+
+        let mut node = Node::new(
+            graph_id,
+            Operator {
+                domain: Some(model.intern("custom")),
+                name: model.intern("MyNode"),
+                overload: None,
+                version: Some(1),
+                origin: "onnx",
+            },
+        );
+        node.name = Some(model.intern("node_main"));
+        node.metadata
+            .insert("node_meta_key".to_owned(), "present".to_owned());
+        node.inputs.push(Some(input));
+        node.outputs.push(Some(weight));
+        node.outputs.push(Some(output));
+        node.attributes.push(Attribute {
+            name: model.intern("bad_graph_attr"),
+            value: AttributeValue::Unsupported("not supported".to_owned()),
+        });
+        let node_id = graph.add_node(node);
+        graph.values[weight.index()].producer = Some(node_id);
+        graph.values[output.index()].producer = Some(node_id);
+        graph.values[input.index()].consumers.push(node_id);
+
+        let function_name = model.intern("my_function");
+        let mut function_node_metadata = BTreeMap::new();
+        function_node_metadata.insert("f_node_attr".to_owned(), "present".to_owned());
+        let function = Function {
+            name: function_name,
+            domain: Some(model.intern("fn_domain")),
+            overload: Some(model.intern("v1")),
+            description: None,
+            metadata: {
+                let mut metadata = BTreeMap::new();
+                metadata.insert("function_meta".to_owned(), "present".to_owned());
+                metadata
+            },
+            opsets: Vec::new(),
+            inputs: vec![model.intern("fn_input")],
+            outputs: vec![model.intern("fn_output")],
+            attributes: vec![model.intern("fn_attr")],
+            values: vec![FunctionValue {
+                name: model.intern("fn_weight"),
+                type_info: None,
+                initializer: Some(external_tensor_id),
+            }],
+            nodes: vec![FunctionNode {
+                name: Some(model.intern("fn_node")),
+                description: None,
+                metadata: function_node_metadata,
+                operator: Operator {
+                    domain: Some(model.intern("fn_domain")),
+                    name: model.intern("FnOp"),
+                    overload: None,
+                    version: None,
+                    origin: "onnx-function",
+                },
+                inputs: vec![Some(model.intern("fn_input"))],
+                outputs: vec![Some(model.intern("fn_output"))],
+                attributes: vec![Attribute {
+                    name: model.intern("f_node_attr"),
+                    value: AttributeValue::Unsupported("unsupported".to_owned()),
+                }],
+            }],
+        };
+        model.add_function(function);
+
         model.replace_graph(graph_id, graph);
         model
     }
