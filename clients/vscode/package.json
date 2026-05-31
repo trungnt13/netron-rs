@@ -1,0 +1,53 @@
+{
+  "name": "netron-rs-vscode",
+  "displayName": "netron-rs",
+  "description": "Readonly ONNX and MLIR viewer backed by netron-rs indexed sessions.",
+  "version": "0.1.0",
+  "publisher": "netron-rs",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCustomEditor:netron.overview"
+  ],
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "netron.overview",
+        "displayName": "netron-rs Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.onnx"
+          },
+          {
+            "filenamePattern": "*.mlir"
+          },
+          {
+            "filenamePattern": "*.mlirbc"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "configuration": {
+      "title": "Netron RS",
+      "properties": {
+        "netronRsViewer.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to netron-rs executable. Empty uses workspace target/debug or target/release builds when available."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check extension.js src/extension.js src/netronService.js && node ../web/protocol.test.mjs",
+    "lint": "node --check extension.js src/extension.js src/netronService.js && node ../web/protocol.test.mjs"
+  }
+}
