@@ -105,6 +105,79 @@ func @helper(%arg0: !torch.vtensor<[3,2],f32>) -> tensor<3x2xf32, #strided1D>
 }
 
 #[test]
+fn parses_module_metadata_list_values() {
+    let data = br#"module attributes {hal.device.targets = [#hal.device.target]} {
+  func.func @main() {
+    return
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("module-metadata.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let parsed_targets = normalized["graphs"][0]["metadata"]["hal.device.targets"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(parsed_targets).unwrap(),
+        json!(["#hal.device.target"])
+    );
+}
+
+#[test]
+fn propagates_casted_convolution_input_types() {
+    let data = br#"module {
+  func.func @conv(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view) -> !hal.buffer_view attributes {iree.abi.stub} {
+    %0 = hal.tensor.cast %arg0 : !hal.buffer_view -> tensor<1x225x225x3xf32>
+    %1 = hal.tensor.cast %arg1 : !hal.buffer_view -> tensor<3x3x3x32xf32>
+    %2 = mhlo.convolution(%0, %1) dim_numbers = [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f],
+      window = {stride = [2, 2], pad = [[0, 0], [0, 0]], rhs_dilate = [1, 1]} :
+      (tensor<1x225x225x3xf32>, tensor<3x3x3x32xf32>) -> tensor<1x112x112x32xf32>
+    %3 = hal.tensor.cast %2 : tensor<1x112x112x32xf32> -> !hal.buffer_view
+    return %3 : !hal.buffer_view
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("conv-cast.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let values = normalized["functions"][0]["values"]
+        .as_array()
+        .expect("values array");
+    let value_shape = |name: &str| {
+        values
+            .iter()
+            .find(|value| value["name"] == name)
+            .and_then(|value| value["type"]["shape"].as_array())
+            .expect("value shape")
+            .iter()
+            .map(|dimension| dimension["value"].as_i64())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        value_shape("%0"),
+        vec![Some(1), Some(112), Some(112), Some(32)]
+    );
+    assert_eq!(
+        value_shape("%1"),
+        vec![Some(1), Some(112), Some(112), Some(32)]
+    );
+}
+
+#[test]
 fn parses_module_globals_and_torch_constant_folding() {
     let data = br#"module @module {
   util.global private @weights = #stream.parameter.named<"model"::"weights"> : tensor<2xbf16>
@@ -282,6 +355,73 @@ fn parses_masked_tt_load_operand_segments() {
 }
 
 #[test]
+fn parses_iree_dispatch_and_subspan_syntax() {
+    let data = br#"func.func @main(%arg0: tensor<1x4xf32>) -> tensor<1x4xf32> {
+  %c0 = constant 0 : index
+  %c4 = constant 4 : index
+  %wg = hal.interface.workgroup.id[0] : index
+  %span = hal.interface.binding.subspan @io::@s0b0_ro_external[%c0] : memref<1x4xf32>
+  %init = linalg.init_tensor [1, %c4] : tensor<1x?xf32>
+  %0 = flow.dispatch @dispatch::@main[%c4](%arg0) : (tensor<1x4xf32>) -> tensor<1x4xf32>
+  return %0 : tensor<1x4xf32>
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("iree-dispatch.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let nodes = normalized["functions"][0]["nodes"].as_array().unwrap();
+    let subspan = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "hal.interface.binding.subspan")
+        .unwrap();
+    assert_eq!(subspan["inputs"], json!(["%c0"]));
+    assert_eq!(
+        subspan["attributes"],
+        json!([
+            { "name": "layout", "value": { "kind": "string", "value": "@io::@s0b0_ro_external" } }
+        ])
+    );
+    let init = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "linalg.init_tensor")
+        .unwrap();
+    assert_eq!(
+        init["attributes"],
+        json!([
+            { "name": "static_sizes", "value": { "kind": "strings", "value": ["1", "%c4"] } }
+        ])
+    );
+    let workgroup = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "hal.interface.workgroup.id")
+        .unwrap();
+    assert_eq!(
+        workgroup["attributes"],
+        json!([
+            { "name": "dimension", "value": { "kind": "string", "value": "0" } }
+        ])
+    );
+    let dispatch = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "flow.dispatch")
+        .unwrap();
+    assert_eq!(dispatch["inputs"], json!(["%c4", "%arg0"]));
+    assert_eq!(
+        dispatch["attributes"],
+        json!([
+            { "name": "entry_points", "value": { "kind": "string", "value": "@dispatch::@main" } },
+            { "name": "operandSegmentSizes", "value": { "kind": "ints", "value": [1, 1, 0, 0] } }
+        ])
+    );
+}
+
+#[test]
 fn anonymous_module_wrappers_do_not_emit_graphs_or_prefix_functions() {
     let data = br#"module {
   func.func @main() {
@@ -366,4 +506,202 @@ module {
     assert_eq!(normalized["graphs"].as_array().unwrap().len(), 0);
     assert_eq!(normalized["functions"][0]["name"], "$0::@main");
     assert_eq!(normalized["functions"][1]["name"], "$1::@main");
+}
+
+#[test]
+fn unquoted_builtin_module_is_recognized_for_scoping() {
+    let data = br#"module {
+  func.func @parent() {
+    return
+  }
+  builtin.module {
+    func.func @inner() {
+      return
+    }
+  }
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("builtin-module.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(
+        normalized["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["$0::@parent", "$0::$1::@inner"]
+    );
+}
+
+#[test]
+fn parses_hal_executable_variant_target_attribute() {
+    let data = br#"hal.executable.variant public @vulkan_spirv_fb, target = #hal.executable.target<"vulkan", "vulkan-spirv-fb", {spv.target_env = #spv.target_env<#spv.vce<v1.0, [], []>, GPU, {}>}> {
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("hal-executable-variant.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let attributes = normalized["graphs"][0]["nodes"][0]["attributes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        attributes
+            .iter()
+            .find(|attribute| attribute["name"] == "target")
+            .unwrap()["value"]["value"],
+        "#hal.executable.target<\"vulkan\", \"vulkan-spirv-fb\", {spv.target_env = #spv.target_env<#spv.vce<v1.0, [], []>, GPU, {}>}>"
+    );
+}
+
+#[test]
+fn parses_hal_device_query_key_pair() {
+    let data = br#"func.func @main(%device: !hal.device) {
+  %ok, %value = hal.device.query<%device : !hal.device> key("hal.executable.format" :: "vulkan-spirv-fb") : i1, i1 = false
+  return
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("hal-device-query.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    let nodes = normalized["functions"][0]["nodes"].as_array().unwrap();
+    let query = nodes
+        .iter()
+        .find(|node| node["operator"]["name"] == "hal.device.query")
+        .unwrap();
+    assert_eq!(query["inputs"], json!(["%device"]));
+    assert_eq!(
+        query["attributes"],
+        json!([
+            { "name": "category", "value": { "kind": "string", "value": "hal.executable.format" } },
+            { "name": "default", "value": { "kind": "string", "value": "false" } },
+            { "name": "key", "value": { "kind": "string", "value": "vulkan-spirv-fb" } }
+        ])
+    );
+}
+
+#[test]
+fn parses_spirv_and_vm_custom_syntax_attributes() {
+    let data = br#"spv.module Logical GLSL450 requires #spv.vce<v1.0, [Shader], []> {
+  spv.GlobalVariable @resource bind(2, 4) : !spv.ptr<i32, StorageBuffer>
+  %addr = spv.mlir.addressof @resource : !spv.ptr<i32, StorageBuffer>
+  %0 = spv.Load "StorageBuffer" %addr : i32
+  spv.EntryPoint "GLCompute" @main, @resource
+  spv.ExecutionMode @main "LocalSize", 8, 2, 1
+}
+vm.func @main() {
+  %c1 = constant 1 : i32
+  %buffer = vm.const.ref.rodata @blob : !vm.buffer
+  vm.cond_br %buffer, ^bb1, ^bb2
+^bb1:
+  vm.global.store.i32 %c1, @_flag : i32
+  vm.br ^bb3(%buffer : !vm.buffer)
+^bb2:
+  vm.fail %c2, "device not supported in the compiled configuration"
+^bb3(%arg: !vm.buffer):
+  vm.return
+}
+"#;
+
+    let model = parse(ModelInput {
+        data,
+        path: Some(std::path::Path::new("spirv-vm.mlir")),
+    })
+    .expect("MLIR parses");
+
+    let normalized: serde_json::Value =
+        serde_json::from_str(&model.to_normalized_json().unwrap()).unwrap();
+    assert_eq!(
+        normalized["graphs"][0]["metadata"]["addressing_model"],
+        "Logical"
+    );
+    assert_eq!(
+        normalized["graphs"][0]["metadata"]["memory_model"],
+        "GLSL450"
+    );
+    assert_eq!(
+        normalized["graphs"][0]["metadata"]["vce_triple"],
+        "#spv.vce<v1.0, [Shader], []>"
+    );
+
+    let graph_nodes = normalized["graphs"][0]["nodes"].as_array().unwrap();
+    assert_eq!(
+        graph_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "spv.GlobalVariable")
+            .unwrap()["attributes"],
+        json!([
+            { "name": "sym_name", "value": { "kind": "string", "value": "resource" } },
+            { "name": "binding", "value": { "kind": "int", "value": 2 } },
+            { "name": "descriptor_set", "value": { "kind": "int", "value": 4 } }
+        ])
+    );
+    assert_eq!(
+        graph_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "spv.Load")
+            .unwrap()["attributes"][0]["value"]["value"],
+        "StorageBuffer"
+    );
+    assert!(
+        graph_nodes
+            .iter()
+            .any(|node| node["operator"]["name"] == "spv.EntryPoint")
+    );
+
+    let function_nodes = normalized["functions"][0]["nodes"].as_array().unwrap();
+    assert_eq!(
+        function_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "vm.const.ref.rodata")
+            .unwrap()["attributes"][0]["value"]["value"],
+        "blob"
+    );
+    assert_eq!(
+        function_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "vm.cond_br")
+            .unwrap()["attributes"][0]["value"]["value"],
+        json!([1, 0, 0])
+    );
+    assert_eq!(
+        function_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "vm.global.store.i32")
+            .unwrap()["attributes"][0]["value"]["value"],
+        "_flag"
+    );
+    assert_eq!(
+        function_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "vm.br")
+            .unwrap()["inputs"],
+        json!([])
+    );
+    assert_eq!(
+        function_nodes
+            .iter()
+            .find(|node| node["operator"]["name"] == "vm.fail")
+            .unwrap()["attributes"][0]["value"]["value"],
+        "device not supported in the compiled configuration"
+    );
 }

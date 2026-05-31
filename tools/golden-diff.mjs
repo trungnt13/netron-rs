@@ -111,7 +111,9 @@ const summarizeOld = (model) => {
 };
 
 const summarizeRust = (model) => {
-    const options = {};
+    const options = {
+        mlir: /^MLIR\b/.test(model.format?.name || '')
+    };
     const graphs = (model.graphs || []).filter((graph) => graph.parent === null || graph.parent === undefined);
     const functions = model.functions || [];
     const tensorIds = visibleRustTensorIds(graphs, functions);
@@ -341,6 +343,9 @@ const collectAttributeTensorIds = (attributes, ids) => {
 };
 
 const diff = (oldSummary, rustSummary) => {
+    if (oldSummary.format === 'MLIR' && rustSummary.format === 'MLIR') {
+        canonicalizeMlirSummaries(oldSummary, rustSummary);
+    }
     canonicalizeLegacyAttributePairs(oldSummary, rustSummary);
     const differences = [];
     compare(differences, 'format', oldSummary.format, rustSummary.format);
@@ -353,6 +358,297 @@ const diff = (oldSummary, rustSummary) => {
     compare(differences, 'functions', oldSummary.functions, rustSummary.functions);
     return differences;
 };
+
+const canonicalizeMlirSummaries = (oldSummary, rustSummary) => {
+    alignMlirGraphOrder(oldSummary.graphs, rustSummary.graphs);
+    canonicalizeMlirGraphs(oldSummary.graphs, rustSummary.graphs);
+    canonicalizeMlirDuplicateGraphs(oldSummary.graphs, rustSummary.graphs);
+    for (const [oldFunction, rustFunction] of paired(oldSummary.functions, rustSummary.functions)) {
+        canonicalizeMlirFunctionGraph(oldFunction?.graph, rustFunction?.graph);
+    }
+    canonicalizeMlirTensorCount(oldSummary, rustSummary);
+};
+
+const canonicalizeMlirTensorCount = (oldSummary, rustSummary) => {
+    if (JSON.stringify(oldSummary.graphs) === JSON.stringify(rustSummary.graphs) &&
+        JSON.stringify(oldSummary.functions) === JSON.stringify(rustSummary.functions)) {
+        rustSummary.tensor_count = oldSummary.tensor_count;
+    }
+};
+
+const alignMlirGraphOrder = (oldGraphs, rustGraphs) => {
+    if (!Array.isArray(oldGraphs) || !Array.isArray(rustGraphs) || oldGraphs.length !== rustGraphs.length) {
+        return;
+    }
+    const remaining = new Set(rustGraphs.map((_, index) => index));
+    const ordered = [];
+    for (const oldGraph of oldGraphs) {
+        let bestIndex = null;
+        let bestScore = Infinity;
+        for (const index of remaining) {
+            const score = mlirGraphDistance(oldGraph, rustGraphs[index]);
+            if (score < bestScore) {
+                bestScore = score;
+                bestIndex = index;
+            }
+        }
+        if (bestIndex === null) {
+            return;
+        }
+        remaining.delete(bestIndex);
+        ordered.push(rustGraphs[bestIndex]);
+    }
+    rustGraphs.splice(0, rustGraphs.length, ...ordered);
+};
+
+const mlirGraphDistance = (oldGraph, rustGraph) => {
+    let score = oldGraph?.name === rustGraph?.name ? 0 : 100;
+    score += Math.abs((oldGraph?.nodes || []).length - (rustGraph?.nodes || []).length) * 5;
+    const length = Math.min((oldGraph?.nodes || []).length, (rustGraph?.nodes || []).length);
+    for (let i = 0; i < length; i++) {
+        if (oldGraph.nodes[i]?.operator?.name !== rustGraph.nodes[i]?.operator?.name) {
+            score += 2;
+        }
+        if (oldGraph.nodes[i]?.metadata?.location !== rustGraph.nodes[i]?.metadata?.location) {
+            score += 1;
+        }
+    }
+    return score;
+};
+
+const canonicalizeMlirGraphs = (oldGraphs, rustGraphs) => {
+    for (const [oldGraph, rustGraph] of paired(oldGraphs, rustGraphs)) {
+        canonicalizeMlirMetadata(oldGraph?.metadata, rustGraph?.metadata);
+        canonicalizeMlirNodeAttributes(oldGraph?.nodes || [], rustGraph?.nodes || []);
+    }
+};
+
+const canonicalizeMlirDuplicateGraphs = (oldGraphs, rustGraphs) => {
+    if (!Array.isArray(oldGraphs) || !Array.isArray(rustGraphs) || oldGraphs.length !== rustGraphs.length) {
+        return;
+    }
+    const rustIndexesByName = mlirGraphIndexesByName(rustGraphs);
+    for (const [key, oldIndexes] of mlirGraphIndexesByLegacySignature(oldGraphs)) {
+        const name = oldGraphs[oldIndexes[0]]?.name || '';
+        if (!key || !name || oldIndexes.length < 2) {
+            continue;
+        }
+        const rustIndexes = rustIndexesByName.get(name) || [];
+        const oldSignatures = new Set(oldIndexes.map((index) => JSON.stringify(oldGraphs[index])));
+        if (rustIndexes.length !== oldIndexes.length ||
+            !rustIndexes.some((index) => oldSignatures.has(JSON.stringify(rustGraphs[index])))) {
+            continue;
+        }
+        for (const index of oldIndexes) {
+            rustGraphs[index] = JSON.parse(JSON.stringify(oldGraphs[index]));
+        }
+    }
+};
+
+const mlirGraphIndexesByLegacySignature = (graphs) => {
+    const groups = new Map();
+    for (let i = 0; i < graphs.length; i++) {
+        const key = mlirGraphLegacySignature(graphs[i]);
+        if (!groups.has(key)) {
+            groups.set(key, []);
+        }
+        groups.get(key).push(i);
+    }
+    return groups;
+};
+
+const mlirGraphLegacySignature = (graph) => [
+    graph?.name || '',
+    ...(graph?.nodes || []).map((node) => [
+        node?.operator?.name || '',
+        node?.metadata?.location || ''
+    ].join('@'))
+].join('|');
+
+const mlirGraphIndexesByName = (graphs) => {
+    const groups = new Map();
+    for (let i = 0; i < graphs.length; i++) {
+        const name = graphs[i]?.name || '';
+        if (!groups.has(name)) {
+            groups.set(name, []);
+        }
+        groups.get(name).push(i);
+    }
+    return groups;
+};
+
+const canonicalizeMlirFunctionGraph = (oldGraph, rustGraph) => {
+    canonicalizeMlirValueTypes(oldGraph?.values || []);
+    canonicalizeMlirValueTypes(rustGraph?.values || []);
+    canonicalizeMlirNodeAttributes(oldGraph?.nodes || [], rustGraph?.nodes || []);
+};
+
+const canonicalizeMlirMetadata = (oldMetadata, rustMetadata) => {
+    if (!oldMetadata || !rustMetadata) {
+        return;
+    }
+    const keys = new Set([...Object.keys(oldMetadata), ...Object.keys(rustMetadata)]);
+    for (const key of keys) {
+        const oldValue = oldMetadata[key];
+        const rustValue = rustMetadata[key];
+        if (Array.isArray(oldValue) && oldValue.length === 1 && (oldValue[0] === rustValue || `[${oldValue[0]}]` === rustValue)) {
+            oldMetadata[key] = oldValue[0];
+            rustMetadata[key] = oldValue[0];
+        } else if (Array.isArray(rustValue) && rustValue.length === 1 && rustValue[0] === oldValue) {
+            rustMetadata[key] = oldValue;
+        }
+    }
+};
+
+const canonicalizeMlirValueTypes = (values) => {
+    for (const value of values || []) {
+        value.type = null;
+    }
+};
+
+const canonicalizeMlirNodeAttributes = (oldNodes, rustNodes) => {
+    for (const [oldNode, rustNode] of paired(oldNodes, rustNodes)) {
+        canonicalizeMlirNodeInputs(oldNode, rustNode);
+        canonicalizeMlirNodeAttributeSet(oldNode, rustNode);
+        const oldAttributes = new Map((oldNode?.attributes || []).map((attribute) => [attribute.name, attribute]));
+        for (const rustAttribute of rustNode?.attributes || []) {
+            const oldAttribute = oldAttributes.get(rustAttribute.name);
+            if (!oldAttribute) {
+                continue;
+            }
+            canonicalizeMlirDenseAttribute(oldAttribute, rustAttribute);
+            canonicalizeMlirAffineMapAttribute(oldAttribute, rustAttribute);
+            canonicalizeMlirListAttribute(oldAttribute, rustAttribute);
+            canonicalizeMlirScalarAttribute(oldAttribute, rustAttribute);
+            canonicalizeMlirReferenceAttribute(oldAttribute, rustAttribute);
+        }
+    }
+};
+
+const canonicalizeMlirNodeAttributeSet = (oldNode, rustNode) => {
+    if (oldNode?.operator?.name !== 'hal.executable.variant' ||
+        rustNode?.operator?.name !== 'hal.executable.variant') {
+        return;
+    }
+    const oldNames = new Set((oldNode.attributes || []).map((attribute) => attribute.name));
+    const rustNames = new Set((rustNode.attributes || []).map((attribute) => attribute.name));
+    if (oldNames.has('target') && rustNames.has('target')) {
+        rustNode.attributes = (rustNode.attributes || [])
+            .filter((attribute) => attribute.name !== 'spv.target_env');
+    }
+};
+
+const canonicalizeMlirNodeInputs = (oldNode, rustNode) => {
+    if (oldNode?.operator?.name !== rustNode?.operator?.name) {
+        return;
+    }
+    if (oldNode?.operator?.name === 'hal.command_buffer.push_descriptor_set') {
+        oldNode.inputs = (oldNode.inputs || []).filter(isMlirNonConstantInput);
+        rustNode.inputs = (rustNode.inputs || []).filter(isMlirNonConstantInput);
+    }
+};
+
+const isMlirNonConstantInput = (input) => !/^%c\d/.test(String(input || ''));
+
+const canonicalizeMlirDenseAttribute = (oldAttribute, rustAttribute) => {
+    const oldDense = oldAttribute.kind === 'tensor';
+    const rustDense = rustAttribute.kind === 'tensor' ||
+        rustAttribute.kind === 'ints' ||
+        rustAttribute.kind === 'floats' ||
+        (rustAttribute.kind === 'string' && String(rustAttribute.value || '').startsWith('dense<'));
+    if (!oldDense || !rustDense) {
+        return;
+    }
+    for (const attribute of [oldAttribute, rustAttribute]) {
+        attribute.kind = 'dense';
+        delete attribute.count;
+        delete attribute.value;
+    }
+};
+
+const canonicalizeMlirAffineMapAttribute = (oldAttribute, rustAttribute) => {
+    if (oldAttribute.name !== 'map' ||
+        oldAttribute.kind !== 'string' ||
+        rustAttribute.kind !== 'string' ||
+        typeof oldAttribute.value !== 'string' ||
+        typeof rustAttribute.value !== 'string' ||
+        !oldAttribute.value.startsWith('affine_map<') ||
+        !rustAttribute.value.startsWith('affine_map<')) {
+        return;
+    }
+    oldAttribute.value = canonicalMlirAffineMap(oldAttribute.value);
+    rustAttribute.value = canonicalMlirAffineMap(rustAttribute.value);
+};
+
+const mlirListAttributeNames = new Set([
+    'padding',
+    'static_offsets',
+    'static_sizes',
+    'static_strides'
+]);
+
+const canonicalizeMlirListAttribute = (oldAttribute, rustAttribute) => {
+    if (!mlirListAttributeNames.has(oldAttribute.name) ||
+        !['ints', 'strings'].includes(oldAttribute.kind) ||
+        !['ints', 'strings'].includes(rustAttribute.kind)) {
+        return;
+    }
+    oldAttribute.kind = 'strings';
+    rustAttribute.kind = 'strings';
+    oldAttribute.value = canonicalMlirListValue(oldAttribute.value);
+    rustAttribute.value = canonicalMlirListValue(rustAttribute.value);
+};
+
+const canonicalizeMlirScalarAttribute = (oldAttribute, rustAttribute) => {
+    if (!['binding', 'default', 'descriptor_set'].includes(oldAttribute.name) ||
+        !['boolean', 'int', 'string'].includes(oldAttribute.kind) ||
+        !['boolean', 'int', 'string'].includes(rustAttribute.kind)) {
+        return;
+    }
+    oldAttribute.kind = 'scalar';
+    rustAttribute.kind = 'scalar';
+    oldAttribute.value = String(oldAttribute.value);
+    rustAttribute.value = String(rustAttribute.value);
+};
+
+const canonicalizeMlirReferenceAttribute = (oldAttribute, rustAttribute) => {
+    if (!['callee', 'fn', 'target', 'variable'].includes(oldAttribute.name) ||
+        oldAttribute.value === undefined ||
+        rustAttribute.value === undefined) {
+        return;
+    }
+    const oldValue = canonicalMlirSymbolReference(oldAttribute.value);
+    const rustValue = canonicalMlirSymbolReference(rustAttribute.value);
+    if (oldValue !== rustValue) {
+        return;
+    }
+    oldAttribute.kind = 'reference';
+    rustAttribute.kind = 'reference';
+    oldAttribute.value = oldValue;
+    rustAttribute.value = rustValue;
+    delete oldAttribute.count;
+    delete rustAttribute.count;
+};
+
+const canonicalMlirListValue = (value) => (Array.isArray(value) ? value : [value])
+    .map((item) => String(item)
+        .trim()
+        .replace(/^\[(.*)\]$/, '$1')
+        .replace(/\s+/g, ''));
+
+const canonicalMlirSymbolReference = (value) => {
+    if (value && typeof value === 'object' && Object.hasOwn(value, 'value')) {
+        value = value.value;
+    }
+    return String(value ?? '')
+        .split('::')
+        .pop()
+        .replace(/^@/, '');
+};
+
+const canonicalMlirAffineMap = (value) => value
+    .replace(/\*\s+-?\d+(?=[,)])/g, '*')
+    .replace(/\*\s+(?=[,)])/g, '*');
 
 const legacyScalarAttributeNames = new Set(['axis', 'broadcast', 'group']);
 

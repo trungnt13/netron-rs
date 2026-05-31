@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use netron_rs_core::{
     Attribute, AttributeValue, Confidence, Dimension, FormatInfo, FormatMetadata, Function,
@@ -56,7 +56,10 @@ fn is_mlir_line(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("module ")
         || line.starts_with("\"builtin.module\"")
+        || line.starts_with("builtin.module ")
         || line.starts_with("vm.module ")
+        || line.starts_with("spv.module ")
+        || line.starts_with("spirv.module ")
         || line.starts_with("func ")
         || line.starts_with("func.func ")
         || line.starts_with('#') && line.contains('=')
@@ -107,10 +110,10 @@ fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
     });
     model.metadata.properties = parsed.metadata;
 
-    for module in parsed.modules {
-        if module.metadata.is_empty()
-            && module.nodes.is_empty()
+    for module in post_order_modules(parsed.modules) {
+        if module.nodes.is_empty()
             && (module.name.is_empty() || module.synthetic)
+            && (module.metadata.is_empty() || module.function_count == 0)
         {
             continue;
         }
@@ -214,6 +217,19 @@ fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
     }
 
     Ok(model)
+}
+
+fn post_order_modules(mut modules: Vec<ParsedModule>) -> Vec<ParsedModule> {
+    modules.sort_by(|left, right| {
+        if !left.name.is_empty() && right.name.starts_with(&format!("{}::", left.name)) {
+            std::cmp::Ordering::Greater
+        } else if !right.name.is_empty() && left.name.starts_with(&format!("{}::", right.name)) {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    modules
 }
 
 fn lower_attribute(model: &mut Model, attribute: ParsedAttribute) -> Attribute {
@@ -354,6 +370,7 @@ struct ParsedModel {
 struct ParsedModule {
     name: String,
     synthetic: bool,
+    function_count: usize,
     metadata: BTreeMap<String, String>,
     nodes: Vec<ParsedNode>,
 }
@@ -407,6 +424,7 @@ struct ModuleScope {
     synthetic: bool,
     open_depth: isize,
     parsed_index: Option<usize>,
+    anonymous_child_counter: usize,
 }
 
 struct FunctionCapture {
@@ -430,6 +448,7 @@ fn parse_text(text: &str) -> ParsedModel {
     let synthesize_anonymous_modules = anonymous_module_count(text) > 1;
     let mut anonymous_module_counter = 0usize;
     let mut modules = Vec::<ModuleScope>::new();
+    let mut root_nodes = Vec::<ParsedNode>::new();
     let mut alias: Option<(String, String)> = None;
     let mut header: Option<(usize, String, Option<String>)> = None;
     let mut function: Option<FunctionCapture> = None;
@@ -519,28 +538,42 @@ fn parse_text(text: &str) -> ParsedModel {
             }
         }
 
-        if let Some(module) = parse_module(
-            trimmed,
-            synthesize_anonymous_modules,
-            &mut anonymous_module_counter,
-        ) {
+        if should_parse_module(trimmed, before, &modules)
+            && let Some(mut module) = parse_module(trimmed, synthesize_anonymous_modules, || {
+                next_anonymous_module_name(
+                    trimmed,
+                    before,
+                    &mut modules,
+                    &mut anonymous_module_counter,
+                )
+            })
+        {
+            let scope_name = module.name.clone();
+            let synthetic = module.synthetic;
+            if module.synthetic
+                && !module.name.is_empty()
+                && let Some(prefix) = module_prefix(&modules)
+            {
+                module.name = format!("{prefix}::{}", module.name);
+            }
             parsed.modules.push(module);
             let parsed_index = parsed.modules.len() - 1;
-            let module = &parsed.modules[parsed_index];
             modules.push(ModuleScope {
-                name: module.name.clone(),
-                synthetic: module.synthetic,
+                name: scope_name,
+                synthetic,
                 open_depth: before,
                 parsed_index: Some(parsed_index),
+                anonymous_child_counter: 0,
             });
         }
 
-        if is_function_start(trimmed) {
+        if is_function_start(trimmed) && should_parse_function(before, &modules) {
             if suppress_executable_function(&parsed, &modules, trimmed) {
                 depth += brace_delta(&line);
                 pop_modules(&mut modules, depth);
                 continue;
             }
+            mark_module_function(&mut parsed, &modules, before);
             let prefix = module_prefix(&modules);
             if has_body_open(trimmed) {
                 let after = before + brace_delta(&line);
@@ -557,6 +590,28 @@ fn parse_text(text: &str) -> ParsedModel {
             header = Some((number, trimmed.to_owned(), prefix));
         }
 
+        if before == 0
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('}')
+            && !is_module_start(trimmed)
+            && !is_spirv_module_start(trimmed)
+            && !is_function_start(trimmed)
+            && !is_alias_definition(trimmed)
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with('!')
+            && let Some(parsed_op) = parse_operation(
+                &CapturedLine {
+                    number,
+                    text: line.clone(),
+                    local_depth: 0,
+                },
+                None,
+            )
+            && let Some(node) = parsed_op.node
+        {
+            root_nodes.push(node);
+        }
+
         if before
             == modules
                 .last()
@@ -567,8 +622,11 @@ fn parse_text(text: &str) -> ParsedModel {
             && !trimmed.starts_with("module ")
             && !is_function_start(trimmed)
         {
+            let Some(last_module) = modules.last() else {
+                break;
+            };
             let prefix = module_prefix(&modules);
-            if let Some(index) = modules.last().and_then(|module| module.parsed_index)
+            if let Some(index) = last_module.parsed_index
                 && let Some(parsed_op) = parse_operation(
                     &CapturedLine {
                         number,
@@ -604,6 +662,16 @@ fn parse_text(text: &str) -> ParsedModel {
             lines: Vec::new(),
         }));
     }
+    if !root_nodes.is_empty() {
+        parsed.modules.push(ParsedModule {
+            name: String::new(),
+            synthetic: false,
+            function_count: 0,
+            metadata: BTreeMap::new(),
+            nodes: root_nodes,
+        });
+    }
+    defer_unscoped_functions(&mut parsed.functions);
     finalize_location_metadata(&mut parsed);
     parsed
 }
@@ -612,16 +680,92 @@ fn anonymous_module_count(text: &str) -> usize {
     text.lines()
         .filter(|line| {
             let line = line.trim_start();
-            is_module_start(line) && parse_module_name(line).is_none()
+            (is_module_start(line) || is_spirv_module_start(line))
+                && parse_module_name(line).is_none()
         })
         .count()
+}
+
+fn should_parse_module(line: &str, depth: isize, modules: &[ModuleScope]) -> bool {
+    (is_module_start(line) || is_spirv_module_start(line))
+        && (depth == 0
+            || modules
+                .last()
+                .is_some_and(|module| depth == module.open_depth + 1))
+}
+
+fn should_parse_function(depth: isize, modules: &[ModuleScope]) -> bool {
+    depth == 0
+        || modules
+            .last()
+            .is_some_and(|module| depth == module.open_depth + 1)
+}
+
+fn next_anonymous_module_name(
+    line: &str,
+    depth: isize,
+    modules: &mut [ModuleScope],
+    anonymous_counter: &mut usize,
+) -> String {
+    if is_spirv_module_start(line)
+        && let Some(parent) = modules
+            .last_mut()
+            .filter(|module| depth == module.open_depth + 1)
+    {
+        let name = format!("${}", parent.anonymous_child_counter);
+        parent.anonymous_child_counter += 1;
+        name
+    } else {
+        let name = format!("${anonymous_counter}");
+        *anonymous_counter += 1;
+        name
+    }
 }
 
 fn is_module_start(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("module ")
         || line.starts_with("\"builtin.module\"")
+        || line.starts_with("builtin.module ")
         || line.starts_with("vm.module ")
+}
+
+fn is_spirv_module_start(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("spv.module ") || line.starts_with("spirv.module ")
+}
+
+fn defer_unscoped_functions(functions: &mut Vec<ParsedFunction>) {
+    if !functions
+        .iter()
+        .any(|function| function.name.contains("::"))
+    {
+        return;
+    }
+    let mut scoped = Vec::with_capacity(functions.len());
+    let mut unscoped = Vec::new();
+    for function in functions.drain(..) {
+        if function.name.contains("::") {
+            scoped.push(function);
+        } else {
+            unscoped.push(function);
+        }
+    }
+    scoped.extend(unscoped);
+    *functions = scoped;
+}
+
+fn mark_module_function(parsed: &mut ParsedModel, modules: &[ModuleScope], depth: isize) {
+    let Some(module) = modules
+        .last()
+        .filter(|module| depth == module.open_depth + 1)
+        .and_then(|module| module.parsed_index)
+    else {
+        return;
+    };
+    if let Some(module) = parsed.modules.get_mut(module) {
+        module.function_count += 1;
+    }
 }
 
 fn finalize_location_metadata(parsed: &mut ParsedModel) {
@@ -820,31 +964,47 @@ fn node_symbol_name(node: &ParsedNode) -> Option<&str> {
     })
 }
 
-fn parse_module(
+fn parse_module<F>(
     line: &str,
     synthesize_anonymous: bool,
-    anonymous_counter: &mut usize,
-) -> Option<ParsedModule> {
+    next_anonymous_name: F,
+) -> Option<ParsedModule>
+where
+    F: FnOnce() -> String,
+{
     let trimmed = line.trim_start();
     let rest = if let Some(rest) = trimmed.strip_prefix("module ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("builtin.module ") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("\"builtin.module\"") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("vm.module ") {
         rest
+    } else if let Some(rest) = trimmed.strip_prefix("spv.module ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("spirv.module ") {
+        rest
     } else {
         return None;
     };
-    let metadata = extract_attribute_dict(rest)
+    let mut metadata = extract_attribute_dict(rest)
         .map(parse_metadata_dict)
         .unwrap_or_default();
+    if let Some(visibility) = rest
+        .split_whitespace()
+        .find(|token| matches!(*token, "public" | "private" | "nested"))
+    {
+        metadata.insert("sym_visibility".to_owned(), visibility.to_owned());
+    }
+    if is_spirv_module_start(trimmed) {
+        metadata.extend(parse_spirv_module_metadata(rest));
+    }
     let explicit_name = parse_module_name(line).or_else(|| metadata.get("sym_name").cloned());
     let synthetic = explicit_name.is_none() && synthesize_anonymous;
     let name = explicit_name.unwrap_or_else(|| {
         if synthesize_anonymous {
-            let name = format!("${anonymous_counter}");
-            *anonymous_counter += 1;
-            name
+            next_anonymous_name()
         } else {
             String::new()
         }
@@ -852,6 +1012,7 @@ fn parse_module(
     Some(ParsedModule {
         name,
         synthetic,
+        function_count: 0,
         metadata,
         nodes: Vec::new(),
     })
@@ -861,11 +1022,46 @@ fn parse_module_name(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     let rest = trimmed
         .strip_prefix("module ")
+        .or_else(|| trimmed.strip_prefix("builtin.module "))
         .or_else(|| trimmed.strip_prefix("\"builtin.module\""))
-        .or_else(|| trimmed.strip_prefix("vm.module "))?;
+        .or_else(|| trimmed.strip_prefix("vm.module "))
+        .or_else(|| trimmed.strip_prefix("spv.module "))
+        .or_else(|| trimmed.strip_prefix("spirv.module "))?;
     rest.split_whitespace()
         .find(|value| value.starts_with('@'))
         .map(str::to_owned)
+}
+
+fn parse_spirv_module_metadata(rest: &str) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    let prefix = rest
+        .split_once('{')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(rest);
+    let mut tokens = prefix.split_whitespace().peekable();
+    if tokens.peek().is_some_and(|token| token.starts_with('@')) {
+        tokens.next();
+    }
+    if let Some(addressing_model) = tokens
+        .next()
+        .filter(|token| *token != "attributes" && *token != "requires")
+    {
+        metadata.insert("addressing_model".to_owned(), addressing_model.to_owned());
+    }
+    if let Some(memory_model) = tokens.next().filter(|token| *token != "requires") {
+        metadata.insert("memory_model".to_owned(), memory_model.to_owned());
+    }
+    if let Some(index) = rest.find("requires ") {
+        let value = rest[index + "requires ".len()..]
+            .split_once('{')
+            .map(|(value, _)| value)
+            .unwrap_or(&rest[index + "requires ".len()..])
+            .trim();
+        if !value.is_empty() {
+            metadata.insert("vce_triple".to_owned(), value.to_owned());
+        }
+    }
+    metadata
 }
 
 fn is_function_start(line: &str) -> bool {
@@ -953,6 +1149,7 @@ fn parse_function(capture: FunctionCapture) -> ParsedFunction {
     }
     fold_torch_constants(&mut function);
     fold_dense_initializers(&mut function);
+    normalize_convolution_cast_inputs(&mut function);
     prune_unreferenced_values(&mut function);
 
     function
@@ -1121,6 +1318,50 @@ fn fold_dense_initializers(function: &mut ParsedFunction) {
     function.nodes = nodes;
 }
 
+fn normalize_convolution_cast_inputs(function: &mut ParsedFunction) {
+    let mut cast_outputs = HashSet::<String>::new();
+    let mut convolution_result_types = HashMap::<String, String>::new();
+
+    for node in &function.nodes {
+        if node.operator == "hal.tensor.cast" {
+            cast_outputs.extend(node.outputs.iter().cloned());
+            continue;
+        }
+        if !matches!(
+            node.operator.as_str(),
+            "stablehlo.convolution" | "mhlo.convolution"
+        ) {
+            continue;
+        }
+        let Some(output_type) = node
+            .outputs
+            .first()
+            .and_then(|name| {
+                function
+                    .values
+                    .iter()
+                    .find(|value| value.name == *name)
+                    .and_then(|value| value.type_text.clone())
+            })
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        for input in &node.inputs {
+            convolution_result_types.insert(input.clone(), output_type.clone());
+        }
+    }
+
+    for value in &mut function.values {
+        if !cast_outputs.contains(&value.name) {
+            continue;
+        }
+        if let Some(output_type) = convolution_result_types.get(&value.name) {
+            value.type_text = Some(output_type.clone());
+        }
+    }
+}
+
 fn prune_unreferenced_values(function: &mut ParsedFunction) {
     let mut referenced = std::collections::HashSet::<String>::new();
     referenced.extend(function.inputs.iter().map(|value| value.name.clone()));
@@ -1155,7 +1396,7 @@ struct ParsedOperation {
 
 fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<ParsedOperation> {
     let text = statement.text.trim();
-    if text.is_empty() || text.starts_with('}') || text.starts_with('^') {
+    if text.is_empty() || text.starts_with('}') || text.starts_with('^') || text.starts_with('#') {
         return None;
     }
     let (result_part, rhs) = split_assignment(text);
@@ -1213,6 +1454,12 @@ fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<Par
             });
         }
     }
+    if operator == "hal.interface.binding.subspan" {
+        inputs.extend(subspan_dynamic_dim_inputs(remainder));
+    }
+    if operator == "memref.subview" {
+        inputs = parse_memref_subview_inputs(remainder);
+    }
     if matches!(operator.as_str(), "memref.alloc" | "alloc") {
         stringify_named_attributes(&mut attributes, &["alignment"]);
         attributes.push(ParsedAttribute {
@@ -1223,6 +1470,23 @@ fn parse_operation(statement: &CapturedLine, prefix: Option<&str>) -> Option<Par
     if operator == "affine.for" {
         attributes.extend(parse_affine_for_attrs(remainder));
         inputs.clear();
+    }
+    if operator.starts_with("linalg.")
+        && let Some(segments) = parse_linalg_operand_segments(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "operandSegmentSizes".to_owned(),
+            value: ParsedAttributeValue::Ints(segments),
+        });
+    }
+    if matches!(
+        operator.as_str(),
+        "flow.dispatch" | "flow.dispatch.workgroups"
+    ) {
+        attributes.push(ParsedAttribute {
+            name: "operandSegmentSizes".to_owned(),
+            value: ParsedAttributeValue::Ints(parse_flow_dispatch_operand_segments(remainder)),
+        });
     }
     if operator == "scf.for" {
         attributes.push(ParsedAttribute {
@@ -1372,7 +1636,7 @@ fn parse_operator<'a>(rhs: &'a str, original_line: &str) -> Option<(String, &'a 
         return Some((operator, rest[end + 1..].trim_start(), column));
     }
     let end = trimmed
-        .find(|ch: char| ch.is_whitespace() || ch == '(' || ch == '{')
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '<' | '[' | '{'))
         .unwrap_or(trimmed.len());
     if end == 0 {
         return None;
@@ -1392,7 +1656,7 @@ fn parse_operator<'a>(rhs: &'a str, original_line: &str) -> Option<(String, &'a 
 }
 
 fn parse_inputs(operator: &str, remainder: &str) -> Vec<String> {
-    if operator == "cf.br" {
+    if matches!(operator, "cf.br" | "vm.br") {
         return Vec::new();
     }
     if operator == "cf.cond_br" {
@@ -1402,6 +1666,9 @@ fn parse_inputs(operator: &str, remainder: &str) -> Vec<String> {
         return parse_scf_for_inputs(remainder);
     }
     if operator.ends_with(".for") {
+        return Vec::new();
+    }
+    if operator == "vm.import" {
         return Vec::new();
     }
     if (operator == "call" || operator.ends_with(".call"))
@@ -1495,6 +1762,13 @@ fn parse_scf_for_operand_segments(remainder: &str) -> Vec<i64> {
     vec![1, 1, 1, iter_args]
 }
 
+fn parse_linalg_operand_segments(remainder: &str) -> Option<Vec<i64>> {
+    Some(vec![
+        named_call_value_count(remainder, "ins")? as i64,
+        named_call_value_count(remainder, "outs")? as i64,
+    ])
+}
+
 fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Vec<ParsedAttribute> {
     let mut attributes = if operator == "scf.for" {
         Vec::new()
@@ -1504,6 +1778,14 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
             .unwrap_or_default()
     };
     attributes.extend(parse_symbol_attributes(operator, remainder));
+    if operator == "hal.executable.variant" {
+        if let Some(target) = hal_executable_variant_target(remainder) {
+            attributes.push(ParsedAttribute {
+                name: "target".to_owned(),
+                value: ParsedAttributeValue::String(target),
+            });
+        }
+    }
     if operator == "util.global" {
         return parse_util_global_attributes(remainder);
     }
@@ -1515,8 +1797,53 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
             value: ParsedAttributeValue::String(global),
         });
     }
+    if operator.starts_with("vm.global.load.")
+        && let Some(global) = parse_global_symbol(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "global".to_owned(),
+            value: ParsedAttributeValue::String(global),
+        });
+    }
+    if operator.starts_with("vm.global.store.")
+        && let Some(global) = parse_global_symbol(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "global".to_owned(),
+            value: ParsedAttributeValue::String(global),
+        });
+    }
+    if operator.starts_with("vm.global.")
+        && !operator.starts_with("vm.global.load.")
+        && !operator.starts_with("vm.global.store.")
+        && let Some(value) = vm_global_type_attribute(operator, remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "type".to_owned(),
+            value: ParsedAttributeValue::String(value),
+        });
+    }
+    if operator == "vm.import" {
+        attributes.extend(parse_vm_import_attributes(remainder));
+    }
+    if operator == "vm.export" {
+        attributes.extend(parse_vm_export_attributes(remainder));
+    }
     if operator == "torch.symbolic_int" {
         return parse_torch_symbolic_int_attributes(remainder);
+    }
+    let message = if operator == "vm.fail" {
+        quoted_strings(remainder).into_iter().next()
+    } else if operator == "util.unreachable" {
+        leading_quoted_string(remainder)
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        attributes.push(ParsedAttribute {
+            name: "message".to_owned(),
+            value: ParsedAttributeValue::String(message),
+        });
     }
     if has_constant_attribute(operator) {
         stringify_constant_value_attributes(&mut attributes);
@@ -1524,20 +1851,31 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
     if matches!(operator, "stablehlo.convolution" | "mhlo.convolution") {
         attributes = parse_convolution_attributes(remainder);
     }
-    if (operator == "call" || operator.ends_with(".call") || operator.ends_with(".generic_call"))
+    if (operator == "call"
+        || operator.ends_with(".call")
+        || operator.ends_with(".generic_call")
+        || operator.starts_with("vm.call"))
         && let Some(callee) = parse_call_callee(remainder)
     {
-        let value = if callee.starts_with('@') {
+        let value = if operator.starts_with("vm.call") {
+            attributes.push(ParsedAttribute {
+                name: "callee".to_owned(),
+                value: ParsedAttributeValue::String(callee.trim_start_matches('@').to_owned()),
+            });
+            String::new()
+        } else if callee.starts_with('@') {
             prefix
                 .map(|prefix| format!("{prefix}::{callee}"))
                 .unwrap_or(callee)
         } else {
             callee
         };
-        attributes.push(ParsedAttribute {
-            name: "callee".to_owned(),
-            value: ParsedAttributeValue::Reference(value),
-        });
+        if !value.is_empty() {
+            attributes.push(ParsedAttribute {
+                name: "callee".to_owned(),
+                value: ParsedAttributeValue::Reference(value),
+            });
+        }
     }
     if operator == "bufferization.materialize_in_destination" && remainder.contains(" writable ") {
         attributes.push(ParsedAttribute {
@@ -1545,7 +1883,7 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
             value: ParsedAttributeValue::String(String::new()),
         });
     }
-    if operator == "cf.cond_br" {
+    if matches!(operator, "cond_br" | "cf.cond_br" | "vm.cond_br") {
         attributes.push(ParsedAttribute {
             name: "operandSegmentSizes".to_owned(),
             value: ParsedAttributeValue::Ints(vec![1, 0, 0]),
@@ -1584,6 +1922,176 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
             name: "predicate".to_owned(),
             value: ParsedAttributeValue::String(predicate.trim_matches('"').to_owned()),
         });
+    }
+    if operator == "linalg.init_tensor"
+        && let Some(sizes) = first_bracket_items(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "static_sizes".to_owned(),
+            value: ParsedAttributeValue::Strings(sizes),
+        });
+    }
+    if operator == "hal.interface.binding.subspan"
+        && let Some(layout) = leading_symbol_reference(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "layout".to_owned(),
+            value: ParsedAttributeValue::String(layout),
+        });
+    }
+    if operator == "flow.dispatch"
+        && let Some(entry_points) = leading_symbol_reference(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "entry_points".to_owned(),
+            value: ParsedAttributeValue::String(entry_points),
+        });
+    }
+    if is_workgroup_dimension_op(operator)
+        && let Some(dimension) =
+            first_bracket_items(remainder).and_then(|items| items.first().cloned())
+    {
+        attributes.push(ParsedAttribute {
+            name: "dimension".to_owned(),
+            value: ParsedAttributeValue::String(dimension),
+        });
+    }
+    if operator == "affine.apply"
+        && let Some(map) = affine_map_attribute(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "map".to_owned(),
+            value: ParsedAttributeValue::String(map),
+        });
+    }
+    if operator == "memref.subview" {
+        attributes.extend(parse_memref_subview_attributes(remainder));
+    }
+    if is_scalar_literal_attribute_op(operator)
+        && let Some(value) = leading_scalar_literal(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "value".to_owned(),
+            value: ParsedAttributeValue::String(value),
+        });
+    }
+    if operator == "vm.const.ref.rodata"
+        && let Some(rodata) = leading_symbol_reference(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "rodata".to_owned(),
+            value: ParsedAttributeValue::String(rodata.trim_start_matches('@').to_owned()),
+        });
+    }
+    if matches!(
+        operator,
+        "spv.Load" | "spirv.Load" | "spv.Store" | "spirv.Store"
+    ) && let Some(storage_class) = leading_quoted_string(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "storage_class".to_owned(),
+            value: ParsedAttributeValue::String(storage_class),
+        });
+    }
+    if operator == "spv.mlir.addressof"
+        && let Some(variable) = leading_symbol_reference(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "variable".to_owned(),
+            value: ParsedAttributeValue::String(variable.trim_start_matches('@').to_owned()),
+        });
+    }
+    if operator == "hal.allocator.allocate" {
+        if let Some(value) = named_call_string(remainder, "type") {
+            attributes.push(ParsedAttribute {
+                name: "type".to_owned(),
+                value: ParsedAttributeValue::String(value),
+            });
+        }
+        if let Some(value) = named_call_string(remainder, "usage") {
+            attributes.push(ParsedAttribute {
+                name: "usage".to_owned(),
+                value: ParsedAttributeValue::String(value),
+            });
+        }
+    }
+    if operator == "hal.command_buffer.create" {
+        for name in ["mode", "categories", "affinity", "bindings"] {
+            if let Some(value) = named_call_string(remainder, name) {
+                attributes.push(ParsedAttribute {
+                    name: name.to_owned(),
+                    value: ParsedAttributeValue::String(value),
+                });
+            }
+        }
+    }
+    if operator == "hal.command_buffer.execution_barrier" {
+        for (name, attribute_name) in [
+            ("flags", "flags"),
+            ("source", "source_stage_mask"),
+            ("target", "target_stage_mask"),
+        ] {
+            if let Some(value) = named_call_string(remainder, name) {
+                attributes.push(ParsedAttribute {
+                    name: attribute_name.to_owned(),
+                    value: ParsedAttributeValue::String(value),
+                });
+            }
+        }
+    }
+    if operator == "hal.command_buffer.dispatch.symbol" {
+        if let Some(target) = named_call_string(remainder, "target") {
+            attributes.push(ParsedAttribute {
+                name: "target".to_owned(),
+                value: if target.starts_with('@') {
+                    ParsedAttributeValue::Reference(target)
+                } else {
+                    ParsedAttributeValue::String(target)
+                },
+            });
+        }
+        if let Some(workgroups) = named_bracket_value(remainder, "workgroups") {
+            attributes.push(ParsedAttribute {
+                name: "workgroups".to_owned(),
+                value: ParsedAttributeValue::String(workgroups),
+            });
+        }
+    }
+    if operator == "hal.executable_layout.lookup"
+        && let Some(layouts) = named_call_bracket_body(remainder, "layouts")
+    {
+        attributes.push(ParsedAttribute {
+            name: "layouts".to_owned(),
+            value: ParsedAttributeValue::String(layouts),
+        });
+    }
+    if operator == "hal.device.query" {
+        attributes.extend(parse_hal_device_query_attributes(remainder));
+    }
+    if matches!(operator, "spv.GlobalVariable" | "spirv.GlobalVariable") {
+        attributes.extend(parse_spv_global_variable_attributes(remainder));
+    }
+    if matches!(operator, "spv.CompositeExtract" | "spirv.CompositeExtract")
+        && let Some(indices) = first_bracket_items(remainder)
+    {
+        attributes.push(ParsedAttribute {
+            name: "indices".to_owned(),
+            value: ParsedAttributeValue::Ints(
+                indices
+                    .into_iter()
+                    .filter_map(|item| item.split_whitespace().next()?.parse::<i64>().ok())
+                    .collect(),
+            ),
+        });
+    }
+    if operator == "hal.interface.binding" {
+        attributes.extend(parse_hal_interface_binding_attributes(remainder));
+    }
+    if matches!(operator, "spv.EntryPoint" | "spirv.EntryPoint") {
+        attributes.extend(parse_spv_entry_point_attributes(remainder));
+    }
+    if matches!(operator, "spv.ExecutionMode" | "spirv.ExecutionMode") {
+        attributes.extend(parse_spv_execution_mode_attributes(remainder));
     }
     if operator == "arith.truncf"
         && let Some(mode) = parse_rounding_mode(remainder)
@@ -1692,16 +2200,19 @@ fn parse_attributes(operator: &str, remainder: &str, prefix: Option<&str>) -> Ve
 }
 
 fn parse_symbol_attributes(operator: &str, remainder: &str) -> Vec<ParsedAttribute> {
+    let vm_global_decl = operator.starts_with("vm.global.")
+        && !operator.starts_with("vm.global.load.")
+        && !operator.starts_with("vm.global.store.");
     if !matches!(
         operator,
         "flow.executable"
             | "hal.executable"
+            | "hal.interface"
             | "hal.executable.variant"
             | "hal.executable.entry_point"
             | "vm.rodata"
             | "vm.import"
-            | "vm.export"
-    ) && !operator.starts_with("vm.global.")
+    ) && !vm_global_decl
     {
         return Vec::new();
     }
@@ -1725,7 +2236,13 @@ fn parse_symbol_attributes(operator: &str, remainder: &str) -> Vec<ParsedAttribu
     if let Some(sym_name) = prefix
         .split_whitespace()
         .find_map(|token| token.strip_prefix('@'))
-        .map(|name| name.trim_end_matches(',').to_owned())
+        .map(|name| {
+            name.split_once('(')
+                .map(|(name, _)| name)
+                .unwrap_or(name)
+                .trim_end_matches(',')
+                .to_owned()
+        })
     {
         attributes.push(ParsedAttribute {
             name: "sym_name".to_owned(),
@@ -1733,6 +2250,98 @@ fn parse_symbol_attributes(operator: &str, remainder: &str) -> Vec<ParsedAttribu
         });
     }
     attributes
+}
+
+fn hal_executable_variant_target(remainder: &str) -> Option<String> {
+    let value = named_assignment_value(remainder, "target")?;
+    if let Some(open) = value.find('<')
+        && let Some(close) = matching_angle_delimiter(&value, open)
+    {
+        return Some(value[..=close].to_owned());
+    }
+    Some(value.trim_end_matches('{').trim().to_owned())
+}
+
+fn parse_vm_import_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let Some(signature) = vm_import_function_type(remainder) else {
+        return Vec::new();
+    };
+    vec![ParsedAttribute {
+        name: "function_type".to_owned(),
+        value: ParsedAttributeValue::String(signature),
+    }]
+}
+
+fn vm_import_function_type(remainder: &str) -> Option<String> {
+    let at = remainder.find('@')?;
+    let open = remainder[at..].find('(').map(|index| at + index)?;
+    let close = matching_delimiter(remainder, open, '(', ')')?;
+    let inputs = split_top_level(&remainder[open + 1..close], ',')
+        .into_iter()
+        .filter_map(vm_import_argument_type)
+        .collect::<Vec<_>>();
+    let after = remainder[close + 1..].trim_start();
+    let outputs = if let Some(rest) = after.strip_prefix("->") {
+        let end = rest
+            .find(" attributes ")
+            .or_else(|| rest.find('{'))
+            .unwrap_or(rest.len());
+        let output = rest[..end].trim();
+        if output.is_empty() {
+            "()".to_owned()
+        } else {
+            clean_type_list(output).to_owned()
+        }
+    } else {
+        "()".to_owned()
+    };
+    Some(format!("({}) -> {outputs}", inputs.join(", ")))
+}
+
+fn vm_import_argument_type(argument: &str) -> Option<String> {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return None;
+    }
+    let type_text = argument
+        .split_once(':')
+        .map(|(_, type_text)| type_text)
+        .unwrap_or(argument);
+    Some(clean_type_token(type_text.trim()).to_owned())
+}
+
+fn parse_vm_export_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let Some(function_ref) = leading_symbol_reference(remainder) else {
+        return Vec::new();
+    };
+    let function_ref = function_ref.trim_start_matches('@').to_owned();
+    let export_name = named_call_string(remainder, "as").unwrap_or_else(|| function_ref.clone());
+    vec![
+        ParsedAttribute {
+            name: "export_name".to_owned(),
+            value: ParsedAttributeValue::String(export_name),
+        },
+        ParsedAttribute {
+            name: "function_ref".to_owned(),
+            value: ParsedAttributeValue::String(function_ref),
+        },
+    ]
+}
+
+fn vm_global_type_attribute(operator: &str, remainder: &str) -> Option<String> {
+    if operator == "vm.global.ref" {
+        return Some("[object Object]".to_owned());
+    }
+    if let Some(type_text) = type_annotation(remainder)
+        && !type_text.is_empty()
+    {
+        return Some(type_text);
+    }
+    operator
+        .strip_prefix("vm.global.")
+        .and_then(|suffix| suffix.split('.').next())
+        .filter(|suffix| !suffix.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_global_symbol(remainder: &str) -> Option<String> {
@@ -1814,6 +2423,15 @@ fn first_quoted_string(text: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
+fn leading_quoted_string(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !text.starts_with('"') {
+        return None;
+    }
+    let end = text[1..].find('"')?;
+    Some(text[1..1 + end].to_owned())
+}
+
 fn parse_util_global_attributes(remainder: &str) -> Vec<ParsedAttribute> {
     let mut initial_value = None;
     let mut type_text = None;
@@ -1831,6 +2449,11 @@ fn parse_util_global_attributes(remainder: &str) -> Vec<ParsedAttribute> {
             if !text.is_empty() {
                 type_text = Some(text.to_owned());
             }
+        }
+    } else if let Some(index) = first_top_level_type_separator(remainder) {
+        let text = clean_type_token(&remainder[index + 1..]);
+        if !text.is_empty() {
+            type_text = Some(text.to_owned());
         }
     }
 
@@ -2066,6 +2689,505 @@ fn bracket_value_count(text: &str) -> Option<usize> {
     Some(extract_value_names(&text[open + 1..close]).len())
 }
 
+fn first_bracket_items(text: &str) -> Option<Vec<String>> {
+    let open = text.find('[')?;
+    let close = matching_delimiter(text, open, '[', ']')?;
+    Some(
+        split_top_level(&text[open + 1..close], ',')
+            .into_iter()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn leading_symbol_reference(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !text.starts_with('@') {
+        return None;
+    }
+    let end = text
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, '[' | '(' | '{'))
+        .unwrap_or(text.len());
+    Some(text[..end].trim_end_matches(',').to_owned())
+}
+
+fn parse_flow_dispatch_operand_segments(remainder: &str) -> Vec<i64> {
+    vec![
+        bracket_value_count(remainder).unwrap_or(0) as i64,
+        first_paren_value_count_after_bracket(remainder) as i64,
+        0,
+        0,
+    ]
+}
+
+fn first_paren_value_count_after_bracket(text: &str) -> usize {
+    let offset = text
+        .find('[')
+        .and_then(|open| matching_delimiter(text, open, '[', ']').map(|close| close + 1))
+        .unwrap_or(0);
+    let Some(open) = text[offset..].find('(').map(|index| offset + index) else {
+        return 0;
+    };
+    let Some(close) = matching_delimiter(text, open, '(', ')') else {
+        return 0;
+    };
+    extract_value_names(&text[open + 1..close]).len()
+}
+
+fn named_call_value_count(text: &str, name: &str) -> Option<usize> {
+    let marker = format!("{name}(");
+    let open = text.find(&marker)? + name.len();
+    let close = matching_delimiter(text, open, '(', ')')?;
+    Some(extract_value_names(&text[open + 1..close]).len())
+}
+
+fn named_call_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("{name}(");
+    let open = text.find(&marker)? + name.len();
+    let close = matching_delimiter(text, open, '(', ')')?;
+    Some(text[open + 1..close].trim())
+}
+
+fn named_call_string(text: &str, name: &str) -> Option<String> {
+    Some(named_call_body(text, name)?.trim_matches('"').to_owned())
+}
+
+fn named_call_bracket_body(text: &str, name: &str) -> Option<String> {
+    let mut value = named_call_string(text, name)?;
+    loop {
+        let trimmed = value.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            value = trimmed[1..trimmed.len() - 1].trim().to_owned();
+        } else {
+            return Some(value);
+        }
+    }
+}
+
+fn parse_hal_device_query_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let mut attributes = Vec::new();
+    let mut key_value = None;
+    if let Some(key) = named_call_body(remainder, "key") {
+        let parts = quoted_strings(&key);
+        if let Some(category) = parts.first() {
+            attributes.push(ParsedAttribute {
+                name: "category".to_owned(),
+                value: ParsedAttributeValue::String(category.clone()),
+            });
+        }
+        key_value = parts.last().cloned();
+    }
+    if let Some((_, value)) = remainder.rsplit_once('=')
+        && let Some(default) = value.split_whitespace().next()
+        && matches!(default, "true" | "false")
+    {
+        attributes.push(ParsedAttribute {
+            name: "default".to_owned(),
+            value: ParsedAttributeValue::String(default.to_owned()),
+        });
+    }
+    if let Some(key) = key_value {
+        attributes.push(ParsedAttribute {
+            name: "key".to_owned(),
+            value: ParsedAttributeValue::String(key),
+        });
+    }
+    attributes
+}
+
+fn quoted_strings(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else {
+            break;
+        };
+        values.push(rest[..end].to_owned());
+        rest = &rest[end + 1..];
+    }
+    values
+}
+
+fn parse_spv_global_variable_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let mut attributes = Vec::new();
+    if let Some(name) = leading_symbol_reference(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "sym_name".to_owned(),
+            value: ParsedAttributeValue::String(name.trim_start_matches('@').to_owned()),
+        });
+    }
+    if let Some(built_in) = named_call_string(remainder, "built_in") {
+        attributes.push(ParsedAttribute {
+            name: "built_in".to_owned(),
+            value: ParsedAttributeValue::String(built_in),
+        });
+    }
+    if let Some(initializer) = named_call_symbol(remainder, "initializer") {
+        attributes.push(ParsedAttribute {
+            name: "initializer".to_owned(),
+            value: ParsedAttributeValue::String(initializer),
+        });
+    }
+    if let Some((binding, descriptor_set)) = spv_bind_attribute(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "binding".to_owned(),
+            value: ParsedAttributeValue::Int(binding),
+        });
+        attributes.push(ParsedAttribute {
+            name: "descriptor_set".to_owned(),
+            value: ParsedAttributeValue::Int(descriptor_set),
+        });
+    }
+    attributes
+}
+
+fn parse_hal_interface_binding_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let mut attributes = Vec::new();
+    let prefix = remainder
+        .split_once(',')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(remainder);
+    if let Some(visibility) = prefix
+        .split_whitespace()
+        .find(|token| matches!(token, &"public" | &"private" | &"nested"))
+    {
+        attributes.push(ParsedAttribute {
+            name: "sym_visibility".to_owned(),
+            value: ParsedAttributeValue::String((*visibility).to_owned()),
+        });
+    }
+    if let Some(symbol) = leading_symbol_reference(
+        prefix
+            .split_whitespace()
+            .find(|token| token.starts_with('@'))
+            .unwrap_or_default(),
+    ) {
+        attributes.push(ParsedAttribute {
+            name: "sym_name".to_owned(),
+            value: ParsedAttributeValue::String(symbol.trim_start_matches('@').to_owned()),
+        });
+    }
+    for item in split_top_level(
+        remainder
+            .split_once(',')
+            .map(|(_, suffix)| suffix)
+            .unwrap_or_default(),
+        ',',
+    ) {
+        let Some((name, value)) = item.split_once('=') else {
+            continue;
+        };
+        attributes.push(ParsedAttribute {
+            name: name.trim().to_owned(),
+            value: parse_attribute_value(value.trim()),
+        });
+    }
+    attributes
+}
+
+fn parse_spv_entry_point_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let mut attributes = Vec::new();
+    if let Some(model) = leading_quoted_string(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "execution_model".to_owned(),
+            value: ParsedAttributeValue::String(model),
+        });
+    }
+    if let Some(function) = symbol_references_after_prefix(remainder).last().cloned() {
+        attributes.push(ParsedAttribute {
+            name: "fn".to_owned(),
+            value: ParsedAttributeValue::Reference(function),
+        });
+    }
+    attributes
+}
+
+fn parse_spv_execution_mode_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let mut attributes = Vec::new();
+    if let Some(function) = leading_symbol_reference(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "fn".to_owned(),
+            value: ParsedAttributeValue::Reference(function),
+        });
+    }
+    if let Some(mode) = quoted_string_after_symbol(remainder) {
+        attributes.push(ParsedAttribute {
+            name: "execution_mode".to_owned(),
+            value: ParsedAttributeValue::String(mode),
+        });
+    }
+    let values = spv_execution_mode_values(remainder);
+    if !values.is_empty() {
+        attributes.push(ParsedAttribute {
+            name: "values".to_owned(),
+            value: ParsedAttributeValue::Strings(values),
+        });
+    }
+    attributes
+}
+
+fn named_call_symbol(text: &str, name: &str) -> Option<String> {
+    let value = named_call_string(text, name)?;
+    Some(value.trim_start_matches('@').to_owned())
+}
+
+fn spv_bind_attribute(text: &str) -> Option<(i64, i64)> {
+    let marker = "bind(";
+    let open = text.find(marker)? + marker.len() - 1;
+    let close = matching_delimiter(text, open, '(', ')')?;
+    let items = split_top_level(&text[open + 1..close], ',')
+        .into_iter()
+        .filter_map(|item| item.trim().parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    (items.len() >= 2).then(|| (items[0], items[1]))
+}
+
+fn symbol_references_after_prefix(text: &str) -> Vec<String> {
+    let mut after = text.trim_start();
+    if after.starts_with('"')
+        && let Some(end) = after[1..].find('"')
+    {
+        after = after[1 + end + 1..].trim_start();
+    }
+    after
+        .split(',')
+        .filter_map(|part| leading_symbol_reference(part.trim()))
+        .collect()
+}
+
+fn quoted_string_after_symbol(text: &str) -> Option<String> {
+    let symbol = leading_symbol_reference(text)?;
+    let start = text.find(&symbol)? + symbol.len();
+    leading_quoted_string(&text[start..])
+}
+
+fn spv_execution_mode_values(text: &str) -> Vec<String> {
+    let Some(mode) = quoted_string_after_symbol(text) else {
+        return Vec::new();
+    };
+    let Some(start) = text
+        .find(&format!("\"{mode}\""))
+        .map(|index| index + mode.len() + 2)
+    else {
+        return Vec::new();
+    };
+    text[start..]
+        .split(',')
+        .skip(1)
+        .filter_map(|item| {
+            let token = item.split_whitespace().next()?.trim();
+            (!token.is_empty()).then(|| token.trim_matches('"').to_owned())
+        })
+        .collect()
+}
+
+fn is_workgroup_dimension_op(operator: &str) -> bool {
+    matches!(
+        operator,
+        "flow.dispatch.workgroup.size"
+            | "flow.dispatch.workgroup.id"
+            | "flow.dispatch.workgroup.count"
+            | "hal.interface.workgroup.size"
+            | "hal.interface.workgroup.id"
+            | "hal.interface.workgroup.count"
+    )
+}
+
+fn subspan_dynamic_dim_inputs(remainder: &str) -> Vec<String> {
+    let Some(type_index) = first_top_level_type_separator(remainder) else {
+        return Vec::new();
+    };
+    let suffix = &remainder[type_index + 1..];
+    let Some(open) = suffix.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = matching_delimiter(suffix, open, '{', '}') else {
+        return Vec::new();
+    };
+    extract_value_names(&suffix[open + 1..close])
+}
+
+fn parse_memref_subview_inputs(remainder: &str) -> Vec<String> {
+    let source = remainder
+        .find('[')
+        .map(|index| extract_value_names(&remainder[..index]))
+        .unwrap_or_default();
+    let mut inputs = memref_subview_bracket_groups(remainder)
+        .into_iter()
+        .flat_map(|group| extract_value_names(group))
+        .collect::<Vec<_>>();
+    inputs.extend(source);
+    inputs
+}
+
+fn parse_memref_subview_attributes(remainder: &str) -> Vec<ParsedAttribute> {
+    let groups = memref_subview_bracket_groups(remainder);
+    if groups.len() < 3 {
+        return Vec::new();
+    }
+    let dynamic_counts = groups
+        .iter()
+        .map(|group| extract_value_names(group).len() as i64)
+        .collect::<Vec<_>>();
+    vec![
+        ParsedAttribute {
+            name: "operandSegmentSizes".to_owned(),
+            value: ParsedAttributeValue::Ints(vec![
+                dynamic_counts[0],
+                dynamic_counts[1],
+                dynamic_counts[2],
+                0,
+            ]),
+        },
+        ParsedAttribute {
+            name: "static_offsets".to_owned(),
+            value: ParsedAttributeValue::Strings(static_subview_items(groups[0])),
+        },
+        ParsedAttribute {
+            name: "static_sizes".to_owned(),
+            value: subview_static_ints_or_strings(groups[1]),
+        },
+        ParsedAttribute {
+            name: "static_strides".to_owned(),
+            value: subview_static_ints_or_strings(groups[2]),
+        },
+    ]
+}
+
+fn memref_subview_bracket_groups(remainder: &str) -> Vec<&str> {
+    let end = first_top_level_type_separator(remainder).unwrap_or(remainder.len());
+    let mut groups = Vec::new();
+    let mut index = 0usize;
+    while let Some(relative) = remainder[index..end].find('[') {
+        let open = index + relative;
+        let Some(close) = matching_delimiter(remainder, open, '[', ']') else {
+            break;
+        };
+        groups.push(remainder[open + 1..close].trim());
+        index = close + 1;
+    }
+    groups
+}
+
+fn static_subview_items(group: &str) -> Vec<String> {
+    split_top_level(group, ',')
+        .into_iter()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            if item.starts_with('%') {
+                i64::MIN.to_string()
+            } else {
+                item.to_owned()
+            }
+        })
+        .collect()
+}
+
+fn subview_static_ints_or_strings(group: &str) -> ParsedAttributeValue {
+    let items = static_subview_items(group);
+    let ints = items
+        .iter()
+        .map(|item| item.parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    if ints.iter().all(Option::is_some) {
+        ParsedAttributeValue::Ints(ints.into_iter().map(|item| item.unwrap_or(0)).collect())
+    } else {
+        ParsedAttributeValue::Strings(items)
+    }
+}
+
+fn affine_map_attribute(remainder: &str) -> Option<String> {
+    let index = remainder.find("affine_map<")?;
+    let open = index + "affine_map".len();
+    let close = matching_angle_delimiter(remainder, open)?;
+    Some(normalize_affine_map_attribute(&format!(
+        "affine_map<{}>",
+        &remainder[open + 1..close]
+    )))
+}
+
+fn matching_angle_delimiter(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0isize;
+    let mut quote = false;
+    let mut previous = None;
+    for (index, ch) in text.char_indices().filter(|(index, _)| *index >= open) {
+        if quote {
+            if ch == '"' {
+                quote = false;
+            }
+            previous = Some(ch);
+            continue;
+        }
+        match ch {
+            '"' => quote = true,
+            '<' => depth += 1,
+            '>' if previous != Some('-') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    None
+}
+
+fn normalize_affine_map_attribute(value: &str) -> String {
+    let Some((prefix, suffix)) = value.split_once("->") else {
+        return value.to_owned();
+    };
+    format!("{prefix}->{}", strip_affine_expr_ids(suffix))
+}
+
+fn strip_affine_expr_ids(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut output = String::with_capacity(value.len());
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if matches!(ch, 's' | 'd')
+            && bytes
+                .get(index + 1)
+                .is_some_and(|value| (*value as char).is_ascii_digit())
+        {
+            index += 2;
+            while index < bytes.len() && (bytes[index] as char).is_ascii_digit() {
+                index += 1;
+            }
+            continue;
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+fn is_scalar_literal_attribute_op(operator: &str) -> bool {
+    operator == "spv.Constant" || operator.starts_with("vm.const.")
+}
+
+fn leading_scalar_literal(remainder: &str) -> Option<String> {
+    let end = first_top_level_type_separator(remainder).unwrap_or(remainder.len());
+    let token = remainder[..end]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(',');
+    if token.is_empty() || token.starts_with(['%', '@', '[', '(', '{', '<']) || token.contains("::")
+    {
+        return None;
+    }
+    Some(normalize_scalar_literal(
+        token,
+        type_annotation(remainder).as_deref(),
+    ))
+}
+
 fn dense_literal_count(text: &str) -> usize {
     let Some(dense) = text.find("dense<") else {
         return 0;
@@ -2193,13 +3315,13 @@ fn parse_attribute_dict(text: &str) -> Vec<ParsedAttribute> {
                 .map(|(name, value)| (name.trim(), value.trim()))
                 .unwrap_or((entry, ""));
             let name = normalize_attr_name(name);
-            let value = if name == "value" && has_dense_payload(value) {
+            let value = if name == "qtype" && value.trim_start().starts_with("tensor<") {
+                ParsedAttributeValue::String("[object Object]".to_owned())
+            } else if has_dense_payload(value) {
                 ParsedAttributeValue::Tensor {
                     type_text: type_annotation(value),
                     len: dense_literal_count(value),
                 }
-            } else if name == "qtype" && value.trim_start().starts_with("tensor<") {
-                ParsedAttributeValue::String("[object Object]".to_owned())
             } else {
                 parse_attribute_value(value)
             };
@@ -2209,9 +3331,25 @@ fn parse_attribute_dict(text: &str) -> Vec<ParsedAttribute> {
 }
 
 fn parse_metadata_dict(text: &str) -> BTreeMap<String, String> {
-    parse_attribute_dict(text)
+    split_top_level(text, ',')
         .into_iter()
-        .map(|attribute| (attribute.name, attribute.value.metadata_text()))
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, value) = entry
+                .split_once('=')
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .unwrap_or((entry, ""));
+            let name = normalize_attr_name(name);
+            let value = if value.trim_start().starts_with('[') && value.trim_end().ends_with(']') {
+                metadata_list_text(value)
+            } else {
+                parse_attribute_value(value).metadata_text()
+            };
+            Some((name, value))
+        })
         .collect()
 }
 
@@ -2230,9 +3368,48 @@ impl ParsedAttributeValue {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
-            Self::Strings(values) => format!("[{}]", values.join(",")),
+            Self::Strings(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(|value| json_string_literal(value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         }
     }
+}
+
+fn metadata_list_text(value: &str) -> String {
+    let value = value.trim();
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value);
+    let items = split_top_level(inner, ',')
+        .into_iter()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| json_string_literal(&parse_attribute_value(item).metadata_text()))
+        .collect::<Vec<_>>();
+    format!("[{}]", items.join(","))
+}
+
+fn json_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn parse_attribute_value(value: &str) -> ParsedAttributeValue {
@@ -2561,6 +3738,9 @@ fn result_types(operator: &str, rhs: &str, count: usize) -> Vec<String> {
     if operator == "memref.dim" {
         return vec!["index".to_owned()];
     }
+    if matches!(operator, "affine.apply" | "affine.min" | "affine.max") {
+        return vec!["index".to_owned(); count];
+    }
     if operator == "torch.constant" && rhs.contains("torch.constant.device") {
         return vec!["!torch.Device".to_owned()];
     }
@@ -2587,7 +3767,7 @@ fn result_types(operator: &str, rhs: &str, count: usize) -> Vec<String> {
     if let Some(index) = rhs.rfind(" to ") {
         return split_type_list(&rhs[index + 4..], count);
     }
-    if let Some(index) = rhs.rfind(':') {
+    if let Some(index) = first_top_level_type_separator(rhs) {
         let suffix = rhs[index + 1..].trim();
         if suffix.starts_with('(') && suffix.contains("->") {
             if let Some(arrow) = suffix.rfind("->") {
@@ -2783,8 +3963,14 @@ fn top_level_statements(lines: &[CapturedLine]) -> Vec<CapturedLine> {
     for line in lines {
         let text = line.text.trim();
         if let Some(active) = current.as_mut()
-            && active.text.contains("linalg.")
-            && is_linalg_attribute_continuation(text)
+            && is_bindings_continuation(&active.text)
+        {
+            active.text.push(' ');
+            active.text.push_str(text);
+            continue;
+        }
+        if let Some(active) = current.as_mut()
+            && is_attribute_continuation(&active.text, text)
         {
             active.text.push(' ');
             active.text.push_str(text);
@@ -2814,9 +4000,15 @@ fn top_level_statements(lines: &[CapturedLine]) -> Vec<CapturedLine> {
     statements
 }
 
-fn is_linalg_attribute_continuation(text: &str) -> bool {
-    text.starts_with('}')
-        || (text.contains('=') && !text.starts_with('%') && !text.starts_with('^'))
+fn is_bindings_continuation(active: &str) -> bool {
+    active.contains("bindings([") && !active.contains("])")
+}
+
+fn is_attribute_continuation(active: &str, text: &str) -> bool {
+    let attribute_line = text.starts_with('}')
+        || text.starts_with('(')
+        || (text.contains('=') && !text.starts_with('%') && !text.starts_with('^'));
+    attribute_line && (active.contains("linalg.") || active.contains("convolution"))
 }
 
 fn is_continuation(text: &str) -> bool {
@@ -3356,7 +4548,13 @@ fn first_top_level_type_separator(text: &str) -> Option<usize> {
             ']' => bracket -= 1,
             '{' => brace += 1,
             '}' => brace -= 1,
-            ':' if angle == 0 && paren == 0 && bracket == 0 && brace == 0 => {
+            ':' if angle == 0
+                && paren == 0
+                && bracket == 0
+                && brace == 0
+                && !text[..index].ends_with(':')
+                && !text[index + 1..].starts_with(':') =>
+            {
                 return Some(index);
             }
             _ => {}
