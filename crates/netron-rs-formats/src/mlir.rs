@@ -17,17 +17,23 @@ impl ModelFormat for MlirFormat {
     fn metadata(&self) -> FormatMetadata {
         FormatMetadata {
             name: FORMAT,
-            extensions: &["mlir"],
+            extensions: &["mlir", "mlirbc"],
         }
     }
 
     fn detect(&self, input: ModelInput<'_>) -> Confidence {
+        if is_mlir_bytecode(input.data) {
+            return Confidence::High;
+        }
         let name = input
             .path
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if name.ends_with(".mlirbc") {
+            return Confidence::Medium;
+        }
         if !name.ends_with(".mlir") {
             return Confidence::None;
         }
@@ -47,11 +53,891 @@ impl ModelFormat for MlirFormat {
     }
 
     fn parse(&self, input: ModelInput<'_>) -> Result<Model, ModelError> {
+        if is_mlir_bytecode(input.data) {
+            return parse_bytecode(input.data);
+        }
+        if input
+            .path
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mlirbc"))
+        {
+            return Err(invalid("Invalid MLIR bytecode signature."));
+        }
         let text = std::str::from_utf8(input.data)
             .map_err(|error| invalid(format!("MLIR text is not UTF-8: {error}")))?;
         let parsed = parse_text(text);
         validate_external_resource_paths(input.path, &parsed, input.allow_unsafe_paths)?;
         lower_model(parsed)
+    }
+}
+
+const MLIR_BYTECODE_MAGIC: &[u8; 4] = b"ML\xEFR";
+
+fn is_mlir_bytecode(data: &[u8]) -> bool {
+    data.starts_with(MLIR_BYTECODE_MAGIC)
+}
+
+#[derive(Debug)]
+struct BytecodeSummary {
+    version: u64,
+    producer: String,
+    strings: Vec<String>,
+    dialects: Vec<BytecodeDialect>,
+    operations: Vec<String>,
+    resources: Vec<BytecodeResource>,
+    sections: Vec<BytecodeSection>,
+    attribute_count: usize,
+    type_count: usize,
+    property_count: usize,
+    ir: BytecodeIrSummary,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug)]
+struct BytecodeDialect {
+    name: String,
+    operations: Vec<BytecodeOperationName>,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeOperationName {
+    dialect: String,
+    name: String,
+}
+
+impl BytecodeOperationName {
+    fn full_name(&self) -> String {
+        format!("{}.{}", self.dialect, self.name)
+    }
+}
+
+#[derive(Debug)]
+struct BytecodeSection {
+    id: u8,
+    len: usize,
+    alignment: Option<usize>,
+}
+
+#[derive(Debug)]
+struct BytecodeResource {
+    scope: String,
+    name: String,
+    kind: String,
+}
+
+#[derive(Debug, Default)]
+struct BytecodeIrSummary {
+    operation_names: Vec<String>,
+    operation_count: usize,
+    module_count: usize,
+    function_count: usize,
+    region_count: usize,
+    block_count: usize,
+    value_count: usize,
+    block_argument_count: usize,
+    truncated: bool,
+}
+
+fn parse_bytecode(data: &[u8]) -> Result<Model, ModelError> {
+    let summary = BytecodeParser::new(data).parse()?;
+    let mut model = Model::new(FormatInfo {
+        name: FORMAT,
+        version: Some(format!("Bytecode v{}", summary.version)),
+    });
+    model.metadata.producer = Some(summary.producer.clone());
+    model.metadata.producer_version = Some(format!("bytecode {}", summary.version));
+    model
+        .metadata
+        .properties
+        .insert("bytecode.version".to_owned(), summary.version.to_string());
+    model
+        .metadata
+        .properties
+        .insert("bytecode.producer".to_owned(), summary.producer.clone());
+    model.metadata.properties.insert(
+        "bytecode.string_count".to_owned(),
+        summary.strings.len().to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.attribute_count".to_owned(),
+        summary.attribute_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.type_count".to_owned(),
+        summary.type_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.resource_count".to_owned(),
+        summary.resources.len().to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.property_count".to_owned(),
+        summary.property_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.sections".to_owned(),
+        bytecode_sections_text(&summary.sections),
+    );
+    model.metadata.properties.insert(
+        "bytecode.dialects".to_owned(),
+        summary
+            .dialects
+            .iter()
+            .map(|dialect| dialect.name.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    model.metadata.properties.insert(
+        "bytecode.operation_name_count".to_owned(),
+        summary.operations.len().to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_operation_count".to_owned(),
+        summary.ir.operation_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_module_count".to_owned(),
+        summary.ir.module_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_function_count".to_owned(),
+        summary.ir.function_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_region_count".to_owned(),
+        summary.ir.region_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_block_count".to_owned(),
+        summary.ir.block_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_value_count".to_owned(),
+        summary.ir.value_count.to_string(),
+    );
+    model.metadata.properties.insert(
+        "bytecode.ir_block_argument_count".to_owned(),
+        summary.ir.block_argument_count.to_string(),
+    );
+    if summary.ir.truncated {
+        model
+            .metadata
+            .properties
+            .insert("bytecode.ir_truncated".to_owned(), "true".to_owned());
+    }
+    for (index, resource) in summary.resources.iter().enumerate() {
+        model.metadata.properties.insert(
+            format!("bytecode.resource.{index}.scope"),
+            resource.scope.clone(),
+        );
+        model.metadata.properties.insert(
+            format!("bytecode.resource.{index}.name"),
+            resource.name.clone(),
+        );
+        model.metadata.properties.insert(
+            format!("bytecode.resource.{index}.kind"),
+            resource.kind.clone(),
+        );
+    }
+    for (index, diagnostic) in summary.diagnostics.iter().enumerate() {
+        model
+            .metadata
+            .properties
+            .insert(format!("bytecode.diagnostic.{index}"), diagnostic.clone());
+    }
+
+    let graph_name = model.intern("bytecode");
+    let graph_id = model.add_graph_placeholder(None, Some(graph_name));
+    let mut graph = Graph::new(graph_id, None, Some(graph_name));
+    graph.metadata.insert(
+        "bytecode.summary".to_owned(),
+        "MLIR bytecode operation summary; dialect-specific attributes are lazy metadata".to_owned(),
+    );
+    graph.metadata.insert(
+        "bytecode.regions".to_owned(),
+        summary.ir.region_count.to_string(),
+    );
+    graph.metadata.insert(
+        "bytecode.blocks".to_owned(),
+        summary.ir.block_count.to_string(),
+    );
+    graph.metadata.insert(
+        "bytecode.block_arguments".to_owned(),
+        summary.ir.block_argument_count.to_string(),
+    );
+    let mut operations = if summary.ir.operation_names.is_empty() {
+        summary.operations.clone()
+    } else {
+        summary.ir.operation_names.clone()
+    };
+    if operations.is_empty() {
+        operations.push("bytecode.module".to_owned());
+    }
+    for operation in &operations {
+        let operator = Operator {
+            domain: None,
+            name: model.intern(operation),
+            overload: None,
+            version: None,
+            origin: FORMAT,
+        };
+        graph.add_node(Node::new(graph_id, operator));
+    }
+    model.replace_graph(graph_id, graph);
+    for index in 0..summary
+        .ir
+        .function_count
+        .min(BYTECODE_FUNCTION_SUMMARY_LIMIT)
+    {
+        let function_name = format!("bytecode.func.{index}");
+        let name = model.intern(&function_name);
+        model.add_function(Function {
+            name,
+            domain: None,
+            overload: None,
+            description: None,
+            metadata: BTreeMap::new(),
+            opsets: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            attributes: Vec::new(),
+            values: Vec::new(),
+            nodes: Vec::new(),
+        });
+    }
+    if summary.ir.function_count > BYTECODE_FUNCTION_SUMMARY_LIMIT {
+        model.metadata.properties.insert(
+            "bytecode.function_summary_truncated".to_owned(),
+            "true".to_owned(),
+        );
+    }
+    Ok(model)
+}
+
+fn bytecode_sections_text(sections: &[BytecodeSection]) -> String {
+    sections
+        .iter()
+        .map(|section| match section.alignment {
+            Some(alignment) => format!("{}:{}@{}", section.id, section.len, alignment),
+            None => format!("{}:{}", section.id, section.len),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct BytecodeParser<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> BytecodeParser<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    fn parse(&self) -> Result<BytecodeSummary, ModelError> {
+        let mut reader = BytecodeCursor::new(self.data);
+        let signature = reader.read_bytes(4)?;
+        if signature != MLIR_BYTECODE_MAGIC {
+            return Err(invalid("Invalid MLIR bytecode signature."));
+        }
+        let version = reader.read_varint()?;
+        if version > 6 {
+            return Err(invalid(format!(
+                "Unsupported MLIR bytecode version '{version}'."
+            )));
+        }
+        let producer = reader.read_null_terminated_string()?;
+        let mut sections = Vec::new();
+        let mut section_data: Vec<Option<&'a [u8]>> = vec![None; 9];
+        let mut diagnostics = Vec::new();
+        while !reader.is_empty() {
+            let (section, data) = reader.read_section()?;
+            if usize::from(section.id) >= section_data.len() {
+                diagnostics.push(format!(
+                    "unsupported bytecode section {} ({} bytes)",
+                    section.id, section.len
+                ));
+            } else {
+                section_data[usize::from(section.id)] = Some(data);
+            }
+            sections.push(section);
+        }
+
+        let strings = parse_bytecode_strings(required_section(&section_data, 0)?)?;
+        let mut dialects =
+            parse_bytecode_dialects(required_section(&section_data, 1)?, &strings, version)?;
+        let operations = dialects
+            .iter()
+            .flat_map(|dialect| {
+                dialect
+                    .operations
+                    .iter()
+                    .map(BytecodeOperationName::full_name)
+            })
+            .collect::<Vec<_>>();
+        let (attribute_count, type_count) =
+            parse_attr_type_counts(section_data.get(3).and_then(|section| *section))?;
+        let resources = parse_resources(
+            section_data.get(5).and_then(|section| *section),
+            section_data.get(6).and_then(|section| *section),
+            &strings,
+            &dialects,
+        )?;
+        let property_count =
+            parse_property_count(section_data.get(8).and_then(|section| *section))?;
+        let ir = match section_data.get(4).and_then(|section| *section) {
+            Some(section) => {
+                let op_names = dialects
+                    .iter()
+                    .flat_map(|dialect| dialect.operations.iter().cloned())
+                    .collect::<Vec<_>>();
+                match parse_ir_summary(section, version, &op_names) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        diagnostics.push(error);
+                        BytecodeIrSummary::default()
+                    }
+                }
+            }
+            None => {
+                diagnostics.push("missing bytecode IR section".to_owned());
+                BytecodeIrSummary::default()
+            }
+        };
+        for dialect in &mut dialects {
+            dialect
+                .operations
+                .sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        Ok(BytecodeSummary {
+            version,
+            producer,
+            strings,
+            dialects,
+            operations,
+            resources,
+            sections,
+            attribute_count,
+            type_count,
+            property_count,
+            ir,
+            diagnostics,
+        })
+    }
+}
+
+fn required_section<'a>(sections: &[Option<&'a [u8]>], id: usize) -> Result<&'a [u8], ModelError> {
+    sections
+        .get(id)
+        .and_then(|section| *section)
+        .ok_or_else(|| invalid(format!("Missing MLIR bytecode section '{id}'.")))
+}
+
+fn parse_bytecode_strings(section: &[u8]) -> Result<Vec<String>, ModelError> {
+    let mut reader = BytecodeCursor::new(section);
+    let count = reader.read_usize()?;
+    let mut strings = vec![String::new(); count];
+    let mut string_data_end = section.len();
+    for index in (0..count).rev() {
+        let size = reader.read_usize()?;
+        if size == 0 || string_data_end < size {
+            return Err(invalid("Invalid MLIR bytecode string table."));
+        }
+        let offset = string_data_end - size;
+        let text = std::str::from_utf8(&section[offset..offset + size - 1])
+            .map_err(|error| invalid(format!("MLIR bytecode string is not UTF-8: {error}")))?;
+        strings[index] = text.to_owned();
+        string_data_end = offset;
+    }
+    if reader.position != string_data_end {
+        return Err(invalid("Invalid MLIR bytecode string offsets."));
+    }
+    Ok(strings)
+}
+
+fn parse_bytecode_dialects(
+    section: &[u8],
+    strings: &[String],
+    version: u64,
+) -> Result<Vec<BytecodeDialect>, ModelError> {
+    let mut reader = BytecodeCursor::new(section);
+    let count = reader.read_usize()?;
+    let mut dialects = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name_index = if version < 1 {
+            reader.read_usize()?
+        } else {
+            let (index, has_version) = reader.read_varint_with_flag()?;
+            if has_version {
+                let _ = reader.read_section()?;
+            }
+            index
+        };
+        dialects.push(BytecodeDialect {
+            name: strings
+                .get(name_index)
+                .ok_or_else(|| invalid("Invalid MLIR bytecode dialect name index."))?
+                .clone(),
+            operations: Vec::new(),
+        });
+    }
+    if version >= 4 && !reader.is_empty() {
+        let _ = reader.read_usize()?;
+    }
+    while !reader.is_empty() {
+        let dialect_index = reader.read_usize()?;
+        let operation_count = reader.read_usize()?;
+        let dialect_name = dialects
+            .get(dialect_index)
+            .ok_or_else(|| invalid("Invalid MLIR bytecode dialect index."))?
+            .name
+            .clone();
+        for _ in 0..operation_count {
+            let name_index = if version < 5 {
+                reader.read_usize()?
+            } else {
+                reader.read_varint_with_flag()?.0
+            };
+            let name = strings
+                .get(name_index)
+                .ok_or_else(|| invalid("Invalid MLIR bytecode operation name index."))?
+                .clone();
+            dialects[dialect_index]
+                .operations
+                .push(BytecodeOperationName {
+                    dialect: dialect_name.clone(),
+                    name,
+                });
+        }
+    }
+    Ok(dialects)
+}
+
+fn parse_attr_type_counts(section: Option<&[u8]>) -> Result<(usize, usize), ModelError> {
+    let Some(section) = section else {
+        return Ok((0, 0));
+    };
+    let mut reader = BytecodeCursor::new(section);
+    Ok((reader.read_usize()?, reader.read_usize()?))
+}
+
+fn parse_resources(
+    resource_section: Option<&[u8]>,
+    offset_section: Option<&[u8]>,
+    strings: &[String],
+    dialects: &[BytecodeDialect],
+) -> Result<Vec<BytecodeResource>, ModelError> {
+    let Some(offset_section) = offset_section else {
+        return Ok(Vec::new());
+    };
+    let mut resource_reader = BytecodeCursor::new(resource_section.unwrap_or_default());
+    let mut reader = BytecodeCursor::new(offset_section);
+    let mut resources = Vec::new();
+    let external_groups = reader.read_usize()?;
+    for _ in 0..external_groups {
+        let scope = read_string_index(strings, reader.read_usize()?)?.to_owned();
+        read_resource_group(
+            &mut reader,
+            &mut resource_reader,
+            &mut resources,
+            &scope,
+            strings,
+        )?;
+    }
+    while !reader.is_empty() {
+        let dialect_index = reader.read_usize()?;
+        let scope = dialects
+            .get(dialect_index)
+            .ok_or_else(|| invalid("Invalid MLIR bytecode resource dialect index."))?
+            .name
+            .clone();
+        read_resource_group(
+            &mut reader,
+            &mut resource_reader,
+            &mut resources,
+            &scope,
+            strings,
+        )?;
+    }
+    Ok(resources)
+}
+
+fn read_resource_group(
+    reader: &mut BytecodeCursor<'_>,
+    resource_reader: &mut BytecodeCursor<'_>,
+    resources: &mut Vec<BytecodeResource>,
+    scope: &str,
+    strings: &[String],
+) -> Result<(), ModelError> {
+    let count = reader.read_usize()?;
+    for _ in 0..count {
+        let name = read_string_index(strings, reader.read_usize()?)?.to_owned();
+        let size = reader.read_usize()?;
+        let kind = bytecode_resource_kind(reader.read_byte()?);
+        let _data = resource_reader.read_bytes(size)?;
+        resources.push(BytecodeResource {
+            scope: scope.to_owned(),
+            name,
+            kind: kind.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn read_string_index<'a>(strings: &'a [String], index: usize) -> Result<&'a str, ModelError> {
+    strings
+        .get(index)
+        .map(String::as_str)
+        .ok_or_else(|| invalid("Invalid MLIR bytecode string index."))
+}
+
+fn bytecode_resource_kind(kind: u8) -> &'static str {
+    match kind {
+        0 => "blob",
+        1 => "bool",
+        2 => "string",
+        _ => "unknown",
+    }
+}
+
+fn parse_property_count(section: Option<&[u8]>) -> Result<usize, ModelError> {
+    let Some(section) = section else {
+        return Ok(0);
+    };
+    let mut reader = BytecodeCursor::new(section);
+    reader.read_usize()
+}
+
+const BYTECODE_IR_NODE_LIMIT: usize = 20_000;
+const BYTECODE_FUNCTION_SUMMARY_LIMIT: usize = 1_024;
+
+fn parse_ir_summary(
+    section: &[u8],
+    version: u64,
+    op_names: &[BytecodeOperationName],
+) -> Result<BytecodeIrSummary, String> {
+    let mut scanner = IrScanner {
+        version,
+        op_names,
+        summary: BytecodeIrSummary {
+            region_count: 1,
+            block_count: 1,
+            ..BytecodeIrSummary::default()
+        },
+    };
+    let mut reader = BytecodeCursor::new(section);
+    let header = scanner
+        .read_block_header(&mut reader)
+        .map_err(|error| error.to_string())?;
+    if header.has_args {
+        scanner
+            .read_block_arguments(&mut reader)
+            .map_err(|error| error.to_string())?;
+    }
+    scanner
+        .read_operations(&mut reader, header.num_ops)
+        .map_err(|error| error.to_string())?;
+    Ok(scanner.summary)
+}
+
+struct IrScanner<'a> {
+    version: u64,
+    op_names: &'a [BytecodeOperationName],
+    summary: BytecodeIrSummary,
+}
+
+struct BlockHeader {
+    num_ops: usize,
+    has_args: bool,
+}
+
+impl IrScanner<'_> {
+    fn read_region(&mut self, reader: &mut BytecodeCursor<'_>) -> Result<(), ModelError> {
+        let block_count = reader.read_usize()?;
+        if block_count == 0 {
+            return Ok(());
+        }
+        let value_count = reader.read_usize()?;
+        self.summary.region_count += 1;
+        self.summary.block_count += block_count;
+        self.summary.value_count += value_count;
+        for _ in 0..block_count {
+            let header = self.read_block_header(reader)?;
+            if header.has_args {
+                self.read_block_arguments(reader)?;
+            }
+            self.read_operations(reader, header.num_ops)?;
+        }
+        Ok(())
+    }
+
+    fn read_block_header(
+        &mut self,
+        reader: &mut BytecodeCursor<'_>,
+    ) -> Result<BlockHeader, ModelError> {
+        let raw = reader.read_varint()?;
+        Ok(BlockHeader {
+            num_ops: usize::try_from(raw >> 1)
+                .map_err(|_| invalid("MLIR bytecode block has too many operations."))?,
+            has_args: raw & 1 == 1,
+        })
+    }
+
+    fn read_block_arguments(&mut self, reader: &mut BytecodeCursor<'_>) -> Result<(), ModelError> {
+        let count = reader.read_usize()?;
+        self.summary.block_argument_count += count;
+        self.summary.value_count += count;
+        for _ in 0..count {
+            if self.version >= 4 {
+                let (_type_index, has_location) = reader.read_varint_with_flag()?;
+                if has_location {
+                    let _location = reader.read_usize()?;
+                }
+            } else {
+                let _type_index = reader.read_usize()?;
+                let _location = reader.read_usize()?;
+            }
+        }
+        if self.version >= 3 && reader.read_byte()? != 0 {
+            self.skip_use_list_orders(reader, count)?;
+        }
+        Ok(())
+    }
+
+    fn read_operations(
+        &mut self,
+        reader: &mut BytecodeCursor<'_>,
+        count: usize,
+    ) -> Result<(), ModelError> {
+        for _ in 0..count {
+            let (region_count, isolated) = self.read_operation(reader)?;
+            for _ in 0..region_count {
+                if self.version >= 2 && isolated {
+                    let (section, data) = reader.read_section()?;
+                    if section.id != 4 {
+                        return Err(invalid("Expected MLIR bytecode IR section for region."));
+                    }
+                    let mut nested = BytecodeCursor::new(data);
+                    self.read_region(&mut nested)?;
+                } else {
+                    self.read_region(reader)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_operation(
+        &mut self,
+        reader: &mut BytecodeCursor<'_>,
+    ) -> Result<(usize, bool), ModelError> {
+        let op_index = reader.read_usize()?;
+        let operation = self
+            .op_names
+            .get(op_index)
+            .ok_or_else(|| invalid("Invalid MLIR bytecode operation name index."))?;
+        let op_mask = reader.read_byte()?;
+        let _location = reader.read_usize()?;
+        if self.summary.operation_names.len() < BYTECODE_IR_NODE_LIMIT {
+            self.summary.operation_names.push(operation.full_name());
+        } else {
+            self.summary.truncated = true;
+        }
+        self.summary.operation_count += 1;
+        let name = operation.full_name();
+        if name.ends_with(".module") {
+            self.summary.module_count += 1;
+        }
+        if is_function_start_token(&name) {
+            self.summary.function_count += 1;
+        }
+
+        if op_mask & 0x01 != 0 {
+            let _attributes = reader.read_usize()?;
+        }
+        if op_mask & 0x40 != 0 {
+            let _properties = reader.read_usize()?;
+        }
+        let mut result_count = 0usize;
+        if op_mask & 0x02 != 0 {
+            result_count = reader.read_usize()?;
+            self.summary.value_count += result_count;
+            for _ in 0..result_count {
+                let _type_index = reader.read_usize()?;
+            }
+        }
+        if op_mask & 0x04 != 0 {
+            let operand_count = reader.read_usize()?;
+            for _ in 0..operand_count {
+                let _value_index = reader.read_usize()?;
+            }
+        }
+        if op_mask & 0x08 != 0 {
+            let successor_count = reader.read_usize()?;
+            for _ in 0..successor_count {
+                let _block_index = reader.read_usize()?;
+            }
+        }
+        if self.version >= 3 && op_mask & 0x20 != 0 {
+            self.skip_use_list_orders(reader, result_count)?;
+        }
+        if op_mask & 0x10 != 0 {
+            let raw = reader.read_varint()?;
+            let region_count = usize::try_from(raw >> 1)
+                .map_err(|_| invalid("MLIR bytecode operation has too many regions."))?;
+            return Ok((region_count, raw & 1 == 1));
+        }
+        Ok((0, false))
+    }
+
+    fn skip_use_list_orders(
+        &mut self,
+        reader: &mut BytecodeCursor<'_>,
+        value_count: usize,
+    ) -> Result<(), ModelError> {
+        let order_count = if value_count > 1 {
+            reader.read_usize()?
+        } else {
+            1
+        };
+        for _ in 0..order_count {
+            if value_count > 1 {
+                let _index = reader.read_usize()?;
+            }
+            let raw = reader.read_varint()?;
+            let use_count = usize::try_from(raw >> 1)
+                .map_err(|_| invalid("MLIR bytecode use-list order is too large."))?;
+            for _ in 0..use_count {
+                let _use_index = reader.read_usize()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct BytecodeCursor<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BytecodeCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, position: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position >= self.data.len()
+    }
+
+    fn read_byte(&mut self) -> Result<u8, ModelError> {
+        let byte = *self
+            .data
+            .get(self.position)
+            .ok_or_else(|| invalid("Unexpected end of MLIR bytecode."))?;
+        self.position += 1;
+        Ok(byte)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ModelError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or_else(|| invalid("MLIR bytecode offset overflow."))?;
+        let bytes = self
+            .data
+            .get(self.position..end)
+            .ok_or_else(|| invalid("Unexpected end of MLIR bytecode."))?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_varint(&mut self) -> Result<u64, ModelError> {
+        let mut result = u64::from(self.read_byte()?);
+        if result & 1 != 0 {
+            return Ok(result >> 1);
+        }
+        if result == 0 {
+            let bytes = self.read_bytes(8)?;
+            return Ok(u64::from_le_bytes(bytes.try_into().unwrap()));
+        }
+        let mut mask = 1u64;
+        let mut byte_count = 0u32;
+        let mut shift = 8u32;
+        while result > 0 && result & mask == 0 {
+            if byte_count >= 7 {
+                return Err(invalid("Invalid MLIR bytecode varint."));
+            }
+            result |= u64::from(self.read_byte()?) << shift;
+            mask <<= 1;
+            shift += 8;
+            byte_count += 1;
+        }
+        if byte_count == 0 || byte_count > 7 {
+            return Err(invalid("Invalid MLIR bytecode varint."));
+        }
+        Ok(result >> (byte_count + 1))
+    }
+
+    fn read_usize(&mut self) -> Result<usize, ModelError> {
+        usize::try_from(self.read_varint()?)
+            .map_err(|_| invalid("MLIR bytecode integer does not fit in usize."))
+    }
+
+    fn read_varint_with_flag(&mut self) -> Result<(usize, bool), ModelError> {
+        let raw = self.read_varint()?;
+        Ok((
+            usize::try_from(raw >> 1)
+                .map_err(|_| invalid("MLIR bytecode integer does not fit in usize."))?,
+            raw & 1 == 1,
+        ))
+    }
+
+    fn read_null_terminated_string(&mut self) -> Result<String, ModelError> {
+        let start = self.position;
+        while self.position < self.data.len() && self.data[self.position] != 0 {
+            self.position += 1;
+        }
+        if self.position >= self.data.len() {
+            return Err(invalid("Malformed MLIR bytecode producer string."));
+        }
+        let value = std::str::from_utf8(&self.data[start..self.position])
+            .map_err(|error| invalid(format!("MLIR bytecode producer is not UTF-8: {error}")))?
+            .to_owned();
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn read_section(&mut self) -> Result<(BytecodeSection, &'a [u8]), ModelError> {
+        let id_and_alignment = self.read_byte()?;
+        let len = self.read_usize()?;
+        let alignment = if id_and_alignment & 0x80 != 0 {
+            let alignment = self.read_usize()?;
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(invalid("Invalid MLIR bytecode section alignment."));
+            }
+            while self.position % alignment != 0 {
+                self.position += 1;
+                if self.position > self.data.len() {
+                    return Err(invalid(
+                        "Unexpected end of MLIR bytecode alignment padding.",
+                    ));
+                }
+            }
+            Some(alignment)
+        } else {
+            None
+        };
+        let data = self.read_bytes(len)?;
+        Ok((
+            BytecodeSection {
+                id: id_and_alignment & 0x7f,
+                len,
+                alignment,
+            },
+            data,
+        ))
     }
 }
 

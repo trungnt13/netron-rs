@@ -759,6 +759,7 @@ impl MlirIndex {
         let mut resource_count = 0;
         let mut attributes = Vec::new();
         let mut resources = Vec::new();
+        let mut diagnostics = Vec::new();
 
         for (key, value) in &model.metadata.properties {
             entries.push(mlir_attribute_entry(
@@ -773,6 +774,15 @@ impl MlirIndex {
                 values: vec![value.clone()],
             });
             attribute_count += 1;
+            if key.starts_with("bytecode.diagnostic.") {
+                diagnostics.push(Diagnostic {
+                    handle: None,
+                    kind: DiagnosticKind::Warning,
+                    code: "mlir.bytecode",
+                    message: value.clone(),
+                    source: Some("bytecode".to_owned()),
+                });
+            }
         }
 
         for (module_index, graph) in model.graphs.iter().enumerate() {
@@ -1001,7 +1011,30 @@ impl MlirIndex {
             );
         }
 
-        let operation_count = modules
+        if is_mlir_bytecode_model(model) {
+            for resource in mlir_bytecode_resources(model) {
+                entries.push(SearchEntry::new_with_handle_and_search_terms(
+                    SearchKind::Resource,
+                    EntityHandle::MlirResource {
+                        resource: resource_count,
+                    },
+                    None,
+                    resource_count,
+                    Some(resource.name.clone()),
+                    None,
+                    Some("MLIR"),
+                    [
+                        resource.scope.clone(),
+                        resource.kind.clone(),
+                        "mlirbc".to_owned(),
+                    ],
+                ));
+                resources.push(resource);
+                resource_count += 1;
+            }
+        }
+
+        let mut operation_count = modules
             .iter()
             .map(|module| module.operation_count)
             .sum::<usize>()
@@ -1009,7 +1042,7 @@ impl MlirIndex {
                 .iter()
                 .map(|function| function.operation_count)
                 .sum::<usize>();
-        let value_count = model
+        let mut value_count = model
             .graphs
             .iter()
             .map(|graph| graph.values.len())
@@ -1019,29 +1052,69 @@ impl MlirIndex {
                 .iter()
                 .map(|function| function.values.len())
                 .sum::<usize>();
-        let block_argument_count = functions
+        let mut block_argument_count = functions
             .iter()
             .map(|function| function.block_argument_count)
             .sum();
+        let mut module_count = modules.len();
+        let mut function_count = functions.len();
+        let mut region_count = regions.len();
+        let mut block_count = blocks.len();
+        let mut summary_attribute_count = attribute_count;
+        if is_mlir_bytecode_model(model) {
+            module_count =
+                mlir_bytecode_count(model, "bytecode.ir_module_count").unwrap_or(module_count);
+            function_count =
+                mlir_bytecode_count(model, "bytecode.ir_function_count").unwrap_or(function_count);
+            operation_count = mlir_bytecode_count(model, "bytecode.ir_operation_count")
+                .unwrap_or(operation_count);
+            value_count =
+                mlir_bytecode_count(model, "bytecode.ir_value_count").unwrap_or(value_count);
+            block_argument_count = mlir_bytecode_count(model, "bytecode.ir_block_argument_count")
+                .unwrap_or(block_argument_count);
+            region_count =
+                mlir_bytecode_count(model, "bytecode.ir_region_count").unwrap_or(region_count);
+            block_count =
+                mlir_bytecode_count(model, "bytecode.ir_block_count").unwrap_or(block_count);
+            summary_attribute_count = mlir_bytecode_count(model, "bytecode.attribute_count")
+                .unwrap_or(summary_attribute_count);
+            if let Some(module) = modules.first_mut() {
+                module.operation_count = operation_count;
+                module.value_count = value_count;
+                module.block_argument_count = block_argument_count;
+                module.attribute_count = summary_attribute_count;
+                module.region_count = region_count;
+                module.block_count = block_count;
+            }
+            if let Some(region) = regions.first_mut() {
+                region.block_count = block_count;
+            }
+            if let Some(block) = blocks.first_mut() {
+                block.operation_count = operation_count;
+                block.value_count = value_count;
+                block.block_argument_count = block_argument_count;
+            }
+        }
         let summary = MlirSummary {
-            module_count: modules.len(),
-            function_count: functions.len(),
+            module_count,
+            function_count,
             operation_count,
             value_count,
             block_argument_count,
-            region_count: regions.len(),
-            block_count: blocks.len(),
+            region_count,
+            block_count,
             symbol_count: symbol_set.len(),
             dialect_count: dialects.len(),
-            attribute_count,
+            attribute_count: summary_attribute_count,
             resource_count,
-            diagnostic_count: 0,
+            diagnostic_count: diagnostics.len(),
             modules,
             functions,
             regions,
             blocks,
             dialects: dialects.into_iter().collect(),
         };
+        assign_diagnostic_handles(&mut diagnostics);
 
         Self {
             entries,
@@ -1049,7 +1122,7 @@ impl MlirIndex {
             symbols,
             attributes,
             resources,
-            diagnostics: Vec::new(),
+            diagnostics,
         }
     }
 
@@ -1065,6 +1138,39 @@ impl MlirIndex {
     ) -> Option<EntityDetail> {
         mlir_detail(model, self, handle, limit)
     }
+}
+
+fn is_mlir_bytecode_model(model: &Model) -> bool {
+    model.metadata.properties.contains_key("bytecode.version")
+}
+
+fn mlir_bytecode_count(model: &Model, key: &str) -> Option<usize> {
+    model.metadata.properties.get(key)?.parse().ok()
+}
+
+fn mlir_bytecode_resources(model: &Model) -> Vec<MlirResourceDetail> {
+    let count = mlir_bytecode_count(model, "bytecode.resource_count").unwrap_or_default();
+    (0..count)
+        .filter_map(|index| {
+            Some(MlirResourceDetail {
+                scope: model
+                    .metadata
+                    .properties
+                    .get(&format!("bytecode.resource.{index}.scope"))?
+                    .clone(),
+                name: model
+                    .metadata
+                    .properties
+                    .get(&format!("bytecode.resource.{index}.name"))?
+                    .clone(),
+                kind: model
+                    .metadata
+                    .properties
+                    .get(&format!("bytecode.resource.{index}.kind"))?
+                    .clone(),
+            })
+        })
+        .collect()
 }
 
 fn push_mlir_region_block_summaries(
@@ -4487,6 +4593,36 @@ impl ModelSession {
             FormatIndex::Mlir(index) => Some(limit_mlir_summary(&index.summary, detail_limit)),
             _ => None,
         };
+        let graphs = match &self.index {
+            FormatIndex::Mlir(index) => index.summary.module_count,
+            _ => self.model.graphs.len(),
+        };
+        let functions = match &self.index {
+            FormatIndex::Mlir(index) => index.summary.function_count,
+            _ => self.model.functions.len(),
+        };
+        let nodes = match &self.index {
+            FormatIndex::Mlir(index) => index.summary.operation_count,
+            _ => self
+                .model
+                .graphs
+                .iter()
+                .map(|graph| graph.nodes.len())
+                .sum(),
+        };
+        let values = match &self.index {
+            FormatIndex::Mlir(index) => index.summary.value_count,
+            _ => self
+                .model
+                .graphs
+                .iter()
+                .map(|graph| graph.values.len())
+                .sum(),
+        };
+        let mlir_resources = match &self.index {
+            FormatIndex::Mlir(index) => index.summary.resource_count,
+            _ => mlir_resource_count(&self.model),
+        };
 
         SessionSummary {
             api_version: SESSION_API_VERSION,
@@ -4495,20 +4631,10 @@ impl ModelSession {
             format: self.index.kind(),
             source_format_name: self.model.format.name.to_owned(),
             byte_len: self.source.byte_len,
-            graphs: self.model.graphs.len(),
-            functions: self.model.functions.len(),
-            nodes: self
-                .model
-                .graphs
-                .iter()
-                .map(|graph| graph.nodes.len())
-                .sum(),
-            values: self
-                .model
-                .graphs
-                .iter()
-                .map(|graph| graph.values.len())
-                .sum(),
+            graphs,
+            functions,
+            nodes,
+            values,
             tensors: self.model.tensors.len(),
             initializers,
             subgraphs,
@@ -4516,7 +4642,7 @@ impl ModelSession {
             metadata,
             opsets,
             external_data: external_data_count(&self.model),
-            mlir_resources: mlir_resource_count(&self.model),
+            mlir_resources,
             onnx,
             mlir,
         }
@@ -4966,7 +5092,7 @@ fn mlir_resource_count(model: &Model) -> usize {
     if model.format.name != "MLIR" {
         return 0;
     }
-    model
+    let count = model
         .graphs
         .iter()
         .flat_map(|graph| &graph.nodes)
@@ -4979,7 +5105,11 @@ fn mlir_resource_count(model: &Model) -> usize {
                 .flat_map(|node| &node.attributes),
         )
         .filter(|attribute| model.strings.get(attribute.name) == "rodata")
-        .count()
+        .count();
+    if count > 0 {
+        return count;
+    }
+    mlir_bytecode_count(model, "bytecode.resource_count").unwrap_or(0)
 }
 
 fn content_identity(data: &[u8]) -> String {
@@ -5023,6 +5153,7 @@ fn min_score(left: Option<u8>, right: Option<u8>) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
 
     use netron_rs_core::{
         Attribute, AttributeValue, FormatInfo, Function, FunctionNode, FunctionValue, Graph, Node,
@@ -5076,6 +5207,104 @@ mod tests {
         assert_eq!(summary.functions, 1);
         assert!(summary.source.content_identity.is_some());
         assert!(!session.diagnostics(&SessionLimits::default()).truncated);
+    }
+
+    #[test]
+    fn session_opens_mlir_bytecode_summary_with_function_counts() {
+        let data = std::fs::read(mlirbc_fixture("model.mlirbc")).expect("fixture exists");
+        let session = ModelSession::open(
+            &data,
+            ModelSource::from_memory(Some("model.mlirbc".to_owned()), data.len()),
+        )
+        .expect("open MLIR bytecode session");
+
+        let summary = session.summary(&SessionLimits::default());
+        let mlir = summary.mlir.expect("mlir summary");
+
+        assert_eq!(summary.format, FormatKind::Mlir);
+        assert!(summary.functions > 0);
+        assert!(summary.nodes >= summary.functions);
+        assert_eq!(summary.functions, mlir.function_count);
+        assert_eq!(summary.nodes, mlir.operation_count);
+        assert!(
+            mlir.functions
+                .iter()
+                .any(|function| function.name.as_deref() == Some("bytecode.func.0"))
+        );
+        assert!(!mlir.regions.is_empty());
+        assert!(!mlir.blocks.is_empty());
+        assert!(mlir.dialects.iter().any(|dialect| dialect == "torch"));
+
+        let hits = session.search("func.func", &SessionLimits::default());
+        assert!(
+            hits.iter()
+                .any(|hit| matches!(hit.handle, EntityHandle::MlirOperation { .. }))
+        );
+    }
+
+    #[test]
+    fn mlir_bytecode_unsupported_sections_become_diagnostics() {
+        let mut data = std::fs::read(mlirbc_fixture("model.mlirbc")).expect("fixture exists");
+        let insert_at = data[4..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|index| index + 5)
+            .expect("producer terminator");
+        data.splice(insert_at..insert_at, [9, 1]);
+
+        let session = ModelSession::open(
+            &data,
+            ModelSource::from_memory(Some("unsupported-section.mlirbc".to_owned()), data.len()),
+        )
+        .expect("open MLIR bytecode session");
+        let summary = session.summary(&SessionLimits::default());
+        assert_eq!(summary.format, FormatKind::Mlir);
+        assert_eq!(summary.mlir.as_ref().unwrap().diagnostic_count, 1);
+
+        let diagnostics = session.diagnostics(&SessionLimits::default()).diagnostics;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "mlir.bytecode");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("unsupported bytecode section 9")
+        );
+    }
+
+    #[test]
+    fn mlir_bytecode_resources_surface_in_summary_search_and_detail() {
+        let path = mlirbc_fixture("sd-clip-tank.mlirbc");
+        let data = std::fs::read(&path).expect("fixture exists");
+        let session = ModelSession::open(&data, ModelSource::from_file(path, data.len()))
+            .expect("open fixture");
+
+        let summary = session.summary(&SessionLimits::default());
+        let mlir = summary.mlir.as_ref().expect("mlir summary");
+        assert_eq!(summary.mlir_resources, 1);
+        assert_eq!(mlir.resource_count, 1);
+
+        let hits = session.search("torch_tensor_1_77_torch.int64", &SessionLimits::default());
+        let resource = hits
+            .iter()
+            .find(|entry| matches!(entry.handle, EntityHandle::MlirResource { resource: 0 }))
+            .expect("resource search entry");
+        assert_eq!(resource.kind, SearchKind::Resource);
+
+        let detail = session
+            .detail(
+                &EntityHandle::MlirResource { resource: 0 },
+                &SessionLimits::default(),
+            )
+            .expect("resource detail");
+        assert_eq!(
+            detail.fields.get("name").map(String::as_str),
+            Some("torch_tensor_1_77_torch.int64")
+        );
+        assert_eq!(
+            detail.fields.get("scope").map(String::as_str),
+            Some("builtin")
+        );
+        assert_eq!(detail.fields.get("kind").map(String::as_str), Some("blob"));
     }
 
     #[test]
@@ -6353,6 +6582,12 @@ module attributes {"triton_gpu.num-warps" = 16 : i32} {
 
         model.replace_graph(graph_id, graph);
         model
+    }
+
+    fn mlirbc_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../netron/third_party/test/mlir")
+            .join(name)
     }
 
     fn add_fixture_node(

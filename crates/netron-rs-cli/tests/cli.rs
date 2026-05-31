@@ -181,6 +181,51 @@ fn summary_supports_mlir_input() {
 }
 
 #[test]
+fn summary_supports_mlir_bytecode_input() {
+    let path = mlirbc_fixture("model.mlirbc");
+    let output = Command::new(env!("CARGO_BIN_EXE_netron-rs"))
+        .arg("summary")
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .expect("run mlirbc summary");
+
+    let envelope = success_json(output);
+    assert_eq!(envelope["command"], "summary");
+    assert_eq!(envelope["data"]["format"], "mlir");
+    assert_eq!(envelope["data"]["source_format_name"], "MLIR");
+    assert!(envelope["data"]["functions"].as_u64().unwrap() > 0);
+    assert_eq!(
+        envelope["data"]["functions"],
+        envelope["data"]["mlir"]["function_count"]
+    );
+    assert_eq!(envelope["data"]["mlir"]["modules"][0]["name"], "bytecode");
+    assert_eq!(
+        envelope["data"]["mlir"]["functions"][0]["name"],
+        "bytecode.func.0"
+    );
+    assert!(
+        !envelope["data"]["mlir"]["regions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !envelope["data"]["mlir"]["blocks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        envelope["data"]["mlir"]["dialects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dialect| dialect == "torch")
+    );
+}
+
+#[test]
 fn mlir_symbols_json_reports_symbol_handles() {
     let path = write_mlir_fixture(
         "mlir-symbols",
@@ -662,6 +707,12 @@ fn write_mlir_fixture(name: &str, text: &str) -> std::path::PathBuf {
         .with_extension("mlir");
     fs::write(&path, text).unwrap();
     path
+}
+
+fn mlirbc_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../netron/third_party/test/mlir")
+        .join(name)
 }
 
 fn write_fixture(name: &str) -> std::path::PathBuf {

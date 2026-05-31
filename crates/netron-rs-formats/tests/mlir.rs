@@ -1,8 +1,61 @@
 use netron_rs_core::ModelError;
 use netron_rs_formats::{ModelInput, ToNormalizedJson, parse};
 use serde_json::json;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::{fs, os::unix::fs::symlink, time::SystemTime};
+
+#[test]
+fn parses_mlir_bytecode_header_dialects_and_ir_summary() {
+    let path = mlirbc_fixture("model.mlirbc");
+    let data = std::fs::read(&path).expect("fixture exists");
+    let model = parse(ModelInput {
+        data: &data,
+        path: Some(path.as_path()),
+        allow_unsafe_paths: false,
+    })
+    .expect("MLIR bytecode parses");
+
+    assert_eq!(model.format.name, "MLIR");
+    assert_eq!(model.format.version.as_deref(), Some("Bytecode v6"));
+    assert_eq!(model.metadata.producer.as_deref(), Some("MLIR19.0.0git"));
+    assert_eq!(
+        model
+            .metadata
+            .properties
+            .get("bytecode.version")
+            .map(String::as_str),
+        Some("6")
+    );
+    assert!(
+        model
+            .metadata
+            .properties
+            .get("bytecode.dialects")
+            .is_some_and(|dialects| dialects.contains("torch"))
+    );
+    assert_eq!(model.graphs.len(), 1);
+    assert!(!model.functions.is_empty());
+    assert!(model.graphs[0].nodes.len() > 10);
+    assert!(model.graphs[0].nodes.iter().any(|node| {
+        model.strings.get(node.operator.name) == "func.func"
+            || model.strings.get(node.operator.name) == "builtin.module"
+    }));
+}
+
+#[test]
+fn rejects_bad_mlir_bytecode_magic() {
+    let error = parse(ModelInput {
+        data: b"MLIR-not-bytecode",
+        path: Some(Path::new("bad.mlirbc")),
+        allow_unsafe_paths: false,
+    })
+    .expect_err("bad bytecode should fail");
+    assert!(matches!(
+        error,
+        ModelError::InvalidData { format: "MLIR", .. }
+    ));
+}
 
 #[test]
 fn parses_mlir_functions_calls_and_dense_constants() {
@@ -816,6 +869,12 @@ vm.func @main() {
             .unwrap()["attributes"][0]["value"]["value"],
         "device not supported in the compiled configuration"
     );
+}
+
+fn mlirbc_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../netron/third_party/test/mlir")
+        .join(name)
 }
 
 fn mlir_with_location(location: &str) -> Vec<u8> {
