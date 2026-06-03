@@ -1,19 +1,19 @@
 macro_rules! id_type {
-    ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(u32);
+  ($name:ident) => {
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub struct $name(u32);
 
-        impl $name {
-            pub fn new(index: usize) -> Self {
-                assert!(index <= u32::MAX as usize);
-                Self(index as u32)
-            }
+    impl $name {
+      pub fn new(index: usize) -> Self {
+        assert!(index <= u32::MAX as usize);
+        Self(index as u32)
+      }
 
-            pub fn index(self) -> usize {
-                self.0 as usize
-            }
-        }
-    };
+      pub fn index(self) -> usize {
+        self.0 as usize
+      }
+    }
+  };
 }
 
 id_type!(GraphId);

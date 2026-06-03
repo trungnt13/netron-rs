@@ -14,7 +14,20 @@ This repository is an early Rust implementation inspired by Netron's model inspe
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
-The workspace requires the Rust toolchain declared in `Cargo.toml`.
+The workspace requires the Rust toolchain declared in `rust-toolchain.toml`.
+
+Install the Git pre-commit hook locally with:
+
+```sh
+pre-commit install
+```
+
+Run the hook suite manually with:
+
+```sh
+pre-commit run --all-files
+```
