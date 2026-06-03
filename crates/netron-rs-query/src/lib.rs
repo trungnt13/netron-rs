@@ -6585,6 +6585,13 @@ module attributes {"triton_gpu.num-warps" = 16 : i32} {
     }
 
     fn mlirbc_fixture(name: &str) -> PathBuf {
+        let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mlir")
+            .join(name);
+        if local.exists() {
+            return local;
+        }
+
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../netron/third_party/test/mlir")
             .join(name)

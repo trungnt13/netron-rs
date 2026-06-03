@@ -710,6 +710,13 @@ fn write_mlir_fixture(name: &str, text: &str) -> std::path::PathBuf {
 }
 
 fn mlirbc_fixture(name: &str) -> std::path::PathBuf {
+    let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/mlir")
+        .join(name);
+    if local.exists() {
+        return local;
+    }
+
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../netron/third_party/test/mlir")
         .join(name)

@@ -19,5 +19,6 @@
 *.ico binary
 *.icns binary
 *.onnx binary
+*.mlirbc binary
 *.safetensors binary
 *.bin binary
