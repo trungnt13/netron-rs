@@ -31,11 +31,13 @@ impl ModelFormat for OnnxFormat {
       .and_then(|path| path.extension())
       .and_then(|extension| extension.to_str())
       .map(|extension| extension.to_ascii_lowercase());
+    let json_model = || {
+      looks_like_json_object(input.data)
+        && parse_json_model_proto(input.data).is_ok_and(|model| model.is_onnx_like())
+    };
 
     if extension.as_deref() == Some("onnx") {
-      if looks_like_json_object(input.data)
-        && parse_json_model_proto(input.data).is_ok_and(|model| model.is_onnx_like())
-      {
+      if json_model() {
         return Confidence::Medium;
       }
       if ModelProto::decode(input.data).is_ok_and(|model| model.is_onnx_like()) {
@@ -50,9 +52,7 @@ impl ModelFormat for OnnxFormat {
       return Confidence::None;
     }
 
-    if looks_like_json_object(input.data)
-      && parse_json_model_proto(input.data).is_ok_and(|model| model.is_onnx_like())
-    {
+    if json_model() {
       return Confidence::Medium;
     }
 
@@ -174,7 +174,7 @@ fn lower_model(mut proto: ModelProto) -> Result<Model, ModelError> {
       moved_initializers,
       hidden_inputs,
       input_types,
-    )?;
+    );
     model.add_function(function);
   }
   Ok(model)
@@ -1098,7 +1098,7 @@ fn lower_function(
   moved_initializers: Vec<TensorProto>,
   hidden_inputs: HashSet<String>,
   input_types: HashMap<String, TypeInfo>,
-) -> Result<Function, ModelError> {
+) -> Function {
   let mut values = Vec::new();
   let mut value_table = FunctionValueTable::default();
   for name in proto
@@ -1149,10 +1149,10 @@ fn lower_function(
     {
       ensure_function_value(model, &mut values, &mut value_table, name);
     }
-    nodes.push(lower_function_node(model, proto_node)?);
+    nodes.push(lower_function_node(model, proto_node));
   }
 
-  Ok(Function {
+  Function {
     name: model.intern(&proto.name),
     domain: proto
       .domain
@@ -1194,7 +1194,7 @@ fn lower_function(
       .collect(),
     values,
     nodes,
-  })
+  }
 }
 
 fn function_value_counts(
@@ -1234,6 +1234,7 @@ fn ensure_function_value(
   values.push(FunctionValue {
     name: model.intern(name),
     type_info: None,
+    metadata: BTreeMap::new(),
     initializer: None,
   });
   table.by_name.insert(name.to_owned(), index);
@@ -1275,7 +1276,7 @@ fn attach_function_initializer(
   }
 }
 
-fn lower_function_node(model: &mut Model, proto: NodeProto) -> Result<FunctionNode, ModelError> {
+fn lower_function_node(model: &mut Model, proto: NodeProto) -> FunctionNode {
   let op_domain = proto.domain.as_ref().filter(|domain| !domain.is_empty());
   let (op_type, overload) = node_operator_parts(
     op_domain.map(String::as_str),
@@ -1288,8 +1289,8 @@ fn lower_function_node(model: &mut Model, proto: NodeProto) -> Result<FunctionNo
     .attributes
     .into_iter()
     .map(|attribute| lower_function_attribute(model, attribute))
-    .collect::<Result<Vec<_>, _>>()?;
-  Ok(FunctionNode {
+    .collect();
+  FunctionNode {
     name: proto.name.as_ref().map(|name| model.intern(name)),
     description: proto.doc_string,
     metadata: node_metadata_props(proto.metadata_props),
@@ -1323,7 +1324,7 @@ fn lower_function_node(model: &mut Model, proto: NodeProto) -> Result<FunctionNo
       })
       .collect(),
     attributes,
-  })
+  }
 }
 
 fn node_operator_parts<'a>(
@@ -1352,10 +1353,7 @@ fn node_metadata_props(mut metadata_props: BTreeMap<String, String>) -> BTreeMap
   metadata_props
 }
 
-fn lower_function_attribute(
-  model: &mut Model,
-  proto: AttributeProto,
-) -> Result<Attribute, ModelError> {
+fn lower_function_attribute(model: &mut Model, proto: AttributeProto) -> Attribute {
   let name = model.intern(&proto.name);
   let value = match proto.kind {
     Some(AttributeKind::Float(value)) => AttributeValue::Float(value),
@@ -1385,13 +1383,13 @@ fn lower_function_attribute(
         match String::from_utf8(value) {
           Ok(value) => strings.push(model.intern(value)),
           Err(error) => {
-            return Ok(Attribute {
+            return Attribute {
               name,
               value: AttributeValue::Unsupported(format!(
                 "{} byte string is not UTF-8",
                 error.into_bytes().len()
               )),
-            });
+            };
           }
         }
       }
@@ -1422,7 +1420,7 @@ fn lower_function_attribute(
     None => AttributeValue::Unsupported("missing attribute value".to_owned()),
   };
 
-  Ok(Attribute { name, value })
+  Attribute { name, value }
 }
 
 fn ensure_value_info(

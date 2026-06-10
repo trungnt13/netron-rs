@@ -43,6 +43,14 @@ class NetronServiceClient {
     });
   }
 
+  async searchPage(session, query, limit, cursor = null) {
+    return this.request('search', {
+      ...this.#limitParams(session, limit),
+      query,
+      cursor,
+    });
+  }
+
   async detail(session, handle) {
     return this.request('detail', {
       session,
@@ -50,19 +58,21 @@ class NetronServiceClient {
     });
   }
 
-  async slice(session, handle, maxNodes) {
+  async slice(session, handle, maxNodes, collapse = 'none') {
     return this.request('slice', {
       ...this.#limitParams(session, maxNodes, true),
       handle,
       max_nodes: maxNodes,
+      collapse,
     });
   }
 
-  async layout(session, handle, maxNodes) {
+  async layout(session, handle, maxNodes, collapse = 'none') {
     return this.request('layout', {
       ...this.#limitParams(session, maxNodes, true),
       handle,
       max_nodes: maxNodes,
+      collapse,
     });
   }
 

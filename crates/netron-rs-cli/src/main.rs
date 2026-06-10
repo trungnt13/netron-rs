@@ -7,7 +7,10 @@ use std::time::Instant;
 use memmap2::Mmap;
 use netron_rs_core::{Model, ModelError, ModelInput, TensorStorage};
 use netron_rs_formats::ToNormalizedJson;
-use netron_rs_query::{EntityHandle, FormatKind, ModelSession, ModelSource, SessionLimits};
+use netron_rs_query::{
+  CollapseMode, DEFAULT_NODE_SLICE_DEPTH, EntityHandle, FormatKind, ModelSession, ModelSource,
+  ProjectionOptions, SessionLimits,
+};
 use serde::Serialize;
 
 mod service;
@@ -64,56 +67,76 @@ fn run_command(command: Command) -> Result<(), CliFailure> {
       path,
       selector,
       max_nodes,
+      collapse,
       json,
     } => {
       let mapped = MappedModel::open(&path)?;
-      if json {
-        let session = ModelSession::open(mapped.bytes(), mapped.source())?;
-        let limit = max_nodes.unwrap_or(SessionLimits::default().layout);
-        let limits = SessionLimits {
-          layout: limit,
-          slice: limit,
-          ..SessionLimits::default()
-        };
-        match layout_scope(&session, selector)? {
-          LayoutRequest::Layout(handle) => {
-            let layout = session
-              .layout(&handle, &limits)
-              .ok_or_else(|| CliFailure::invalid("layout scope is not available for this model"))?;
-            print_json("layout", &layout)?;
-          }
-          LayoutRequest::Slice(handle) => {
-            let slice = session
-              .slice(&handle, &limits)
-              .ok_or_else(|| CliFailure::invalid("slice scope is not available for this model"))?;
-            print_json("layout", &slice)?;
+      match selector {
+        LayoutSelector::Graph(graph) if !json && collapse == CollapseMode::None => {
+          let model = netron_rs_formats::parse(mapped.input()).map_err(CliFailure::from)?;
+          let options = netron_rs_layout::LayoutOptions {
+            graph,
+            max_nodes,
+            ..netron_rs_layout::LayoutOptions::default()
+          };
+          println!(
+            "{}",
+            serde_json::to_string_pretty(
+              &netron_rs_layout::layout_model(&model, &options)
+                .map_err(|error| CliFailure::internal(error.to_string()))?
+            )
+            .map_err(CliFailure::from)?
+          );
+        }
+        selector => {
+          let session = ModelSession::open(mapped.bytes(), mapped.source())?;
+          let limit = max_nodes.unwrap_or(SessionLimits::default().layout);
+          let limits = SessionLimits {
+            layout: limit,
+            slice: limit,
+            ..SessionLimits::default()
+          };
+          match layout_scope(&session, selector)? {
+            LayoutRequest::Layout(handle) => {
+              let layout = session
+                .layout_with_options(
+                  &handle,
+                  &limits,
+                  ProjectionOptions {
+                    collapse,
+                    ..ProjectionOptions::default()
+                  },
+                )
+                .ok_or_else(|| {
+                  CliFailure::invalid("layout scope is not available for this model")
+                })?;
+              print_output("layout", json, &layout)?;
+            }
+            LayoutRequest::Slice { handle, depth } => {
+              let slice = session
+                .slice_with_options(
+                  &handle,
+                  &limits,
+                  ProjectionOptions {
+                    collapse,
+                    node_depth: depth,
+                    ..ProjectionOptions::default()
+                  },
+                )
+                .ok_or_else(|| {
+                  CliFailure::invalid("slice scope is not available for this model")
+                })?;
+              print_output("layout", json, &slice)?;
+            }
           }
         }
-      } else {
-        let graph = match selector {
-          LayoutSelector::Graph(graph) => graph,
-          _ => 0,
-        };
-        let model = netron_rs_formats::parse(mapped.input()).map_err(CliFailure::from)?;
-        let options = netron_rs_layout::LayoutOptions {
-          graph,
-          max_nodes,
-          ..netron_rs_layout::LayoutOptions::default()
-        };
-        println!(
-          "{}",
-          serde_json::to_string_pretty(
-            &netron_rs_layout::layout_model(&model, &options)
-              .map_err(|error| CliFailure::internal(error.to_string()))?
-          )
-          .map_err(CliFailure::from)?
-        );
       }
     }
     Command::Search {
       path,
       query,
       limit,
+      cursor,
       json,
     } => {
       let mapped = MappedModel::open(&path)?;
@@ -122,8 +145,13 @@ fn run_command(command: Command) -> Result<(), CliFailure> {
         search: limit,
         ..SessionLimits::default()
       };
-      let hits = session.search(&query, &limits);
-      print_output("search", json, &hits)?;
+      if cursor.is_some() {
+        let page = session.search_page(&query, cursor, &limits);
+        print_output("search", json, &page)?;
+      } else {
+        let hits = session.search(&query, &limits);
+        print_output("search", json, &hits)?;
+      }
     }
     Command::Detail { path, handle, json } => {
       let mapped = MappedModel::open(&path)?;
@@ -150,13 +178,12 @@ fn run_command(command: Command) -> Result<(), CliFailure> {
         ));
       }
       let metadata = session
-        .tensor_metadata(&SessionLimits::default())
-        .into_iter()
-        .find(|entry| matches!(entry.handle, EntityHandle::Tensor { tensor: id } if id == tensor))
+        .tensor_metadata_by_id(tensor)
         .ok_or_else(|| CliFailure::invalid("tensor id is not available"))?;
       print_output("onnx.tensor", json, &metadata)?;
     }
     Command::ServeStdio => service::serve_stdio()?,
+    Command::ServeHttp { listen } => service::serve_http(&listen)?,
   }
   Ok(())
 }
@@ -223,34 +250,30 @@ struct CliFailure {
 }
 
 impl CliFailure {
-  fn invalid(message: impl Into<String>) -> Self {
+  fn new(code: i32, kind: &'static str, message: impl Into<String>) -> Self {
     Self {
-      code: 4,
-      kind: "invalid_request",
+      code,
+      kind,
       message: message.into(),
       command: None,
       json: false,
     }
+  }
+
+  fn invalid(message: impl Into<String>) -> Self {
+    Self::new(4, "invalid_request", message)
   }
 
   fn internal(message: impl Into<String>) -> Self {
-    Self {
-      code: 1,
-      kind: "internal_error",
-      message: message.into(),
-      command: None,
-      json: false,
-    }
+    Self::new(1, "internal_error", message)
   }
 
   fn access_denied(message: impl Into<String>) -> Self {
-    Self {
-      code: 3,
-      kind: "access_denied",
-      message: message.into(),
-      command: None,
-      json: false,
-    }
+    Self::new(3, "access_denied", message)
+  }
+
+  fn canceled(message: impl Into<String>) -> Self {
+    Self::new(5, "canceled", message)
   }
 
   fn with_command(mut self, command: &'static str) -> Self {
@@ -259,9 +282,7 @@ impl CliFailure {
   }
 
   fn or_command(mut self, command: &'static str) -> Self {
-    if self.command.is_none() {
-      self.command = Some(command);
-    }
+    self.command.get_or_insert(command);
     self
   }
 
@@ -289,27 +310,9 @@ impl CliFailure {
 impl From<ModelError> for CliFailure {
   fn from(error: ModelError) -> Self {
     match error {
-      ModelError::UnsupportedFormat => Self {
-        code: 2,
-        kind: "unsupported_format",
-        message: error.to_string(),
-        command: None,
-        json: false,
-      },
-      ModelError::AccessDenied { .. } => Self {
-        code: 3,
-        kind: "access_denied",
-        message: error.to_string(),
-        command: None,
-        json: false,
-      },
-      ModelError::InvalidData { .. } => Self {
-        code: 5,
-        kind: "parse_error",
-        message: error.to_string(),
-        command: None,
-        json: false,
-      },
+      ModelError::UnsupportedFormat => Self::new(2, "unsupported_format", error.to_string()),
+      ModelError::AccessDenied { .. } => Self::access_denied(error.to_string()),
+      ModelError::InvalidData { .. } => Self::new(5, "parse_error", error.to_string()),
       ModelError::Invariant(_) => Self::internal(error.to_string()),
     }
   }
@@ -350,12 +353,14 @@ enum Command {
     path: PathBuf,
     selector: LayoutSelector,
     max_nodes: Option<usize>,
+    collapse: CollapseMode,
     json: bool,
   },
   Search {
     path: PathBuf,
     query: String,
     limit: usize,
+    cursor: Option<usize>,
     json: bool,
   },
   Detail {
@@ -373,6 +378,9 @@ enum Command {
     json: bool,
   },
   ServeStdio,
+  ServeHttp {
+    listen: String,
+  },
 }
 
 enum LayoutSelector {
@@ -380,6 +388,7 @@ enum LayoutSelector {
   Node {
     graph: usize,
     node: usize,
+    depth: usize,
   },
   MlirFunction {
     function: FunctionSelector,
@@ -394,7 +403,7 @@ enum FunctionSelector {
 
 enum LayoutRequest {
   Layout(EntityHandle),
-  Slice(EntityHandle),
+  Slice { handle: EntityHandle, depth: usize },
 }
 
 impl Command {
@@ -433,7 +442,7 @@ impl Command {
       Self::Detail { .. } => "detail",
       Self::MlirSymbols { .. } => "mlir.symbols",
       Self::OnnxTensor { .. } => "onnx.tensor",
-      Self::ServeStdio => "serve",
+      Self::ServeStdio | Self::ServeHttp { .. } => "serve",
     }
   }
 
@@ -483,6 +492,10 @@ fn parse_bench(mut args: Vec<String>) -> Result<Command, CliFailure> {
 fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
   args.remove(0);
   let json = take_flag(&mut args, "--json");
+  let collapse = take_value(&mut args, "--collapse")?
+    .map(|value| parse_collapse_arg(&value))
+    .transpose()?
+    .unwrap_or(CollapseMode::None);
   let mut max_nodes = take_value(&mut args, "--max-nodes")?
     .map(|value| parse_usize_arg(&value, "--max-nodes"))
     .transpose()?;
@@ -498,9 +511,9 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
     .map(|value| parse_usize_arg(&value, "--node"))
     .transpose()?;
   let function = take_value(&mut args, "--function")?;
-  if let Some(depth) = take_value(&mut args, "--depth")? {
-    parse_usize_arg(&depth, "--depth")?;
-  }
+  let depth = take_value(&mut args, "--depth")?
+    .map(|value| parse_usize_arg(&value, "--depth"))
+    .transpose()?;
   let region = take_value(&mut args, "--region")?
     .map(|value| parse_usize_arg(&value, "--region"))
     .transpose()?;
@@ -512,8 +525,12 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
     LayoutSelector::Node {
       graph: graph.unwrap_or(0),
       node,
+      depth: depth.unwrap_or(DEFAULT_NODE_SLICE_DEPTH),
     }
   } else if let Some(function) = function {
+    if depth.is_some() {
+      return Err(CliFailure::invalid("layout --depth requires --node").with_command("layout"));
+    }
     if args.len() != 1 {
       return Err(CliFailure::invalid("layout --function requires <model>").with_command("layout"));
     }
@@ -522,6 +539,9 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
       region,
     }
   } else {
+    if depth.is_some() {
+      return Err(CliFailure::invalid("layout --depth requires --node").with_command("layout"));
+    }
     if region.is_some() {
       return Err(
         CliFailure::invalid("layout --region requires --function").with_command("layout"),
@@ -549,6 +569,7 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
       path,
       selector: LayoutSelector::Graph(selected_graph),
       max_nodes: max_nodes.or(positional_max),
+      collapse,
       json,
     });
   };
@@ -557,6 +578,7 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
     path: PathBuf::from(args.remove(0)),
     selector,
     max_nodes,
+    collapse,
     json,
   })
 }
@@ -564,6 +586,9 @@ fn parse_layout(mut args: Vec<String>) -> Result<Command, CliFailure> {
 fn parse_search(mut args: Vec<String>) -> Result<Command, CliFailure> {
   args.remove(0);
   let json = take_flag(&mut args, "--json");
+  let cursor = take_value(&mut args, "--cursor")?
+    .map(|value| parse_usize_arg(&value, "--cursor"))
+    .transpose()?;
   let flagged_limit = take_value(&mut args, "--limit")?
     .map(|value| parse_usize_arg(&value, "--limit"))
     .transpose()?;
@@ -581,6 +606,7 @@ fn parse_search(mut args: Vec<String>) -> Result<Command, CliFailure> {
     path: PathBuf::from(args.remove(0)),
     query: args.remove(0),
     limit,
+    cursor,
     json,
   })
 }
@@ -620,6 +646,11 @@ fn parse_detail(mut args: Vec<String>) -> Result<Command, CliFailure> {
       scope: required_scope(scope.as_deref(), "--mlir-operation")?,
       operation: parse_usize_arg(&operation, "--mlir-operation")?,
     }
+  } else if let Some(value) = take_value(&mut args, "--mlir-value")? {
+    EntityHandle::MlirValue {
+      scope: required_scope(scope.as_deref(), "--mlir-value")?,
+      value: parse_usize_arg(&value, "--mlir-value")?,
+    }
   } else if let Some(region) = take_value(&mut args, "--mlir-region")? {
     EntityHandle::MlirRegion {
       scope: required_scope(scope.as_deref(), "--mlir-region")?,
@@ -633,6 +664,11 @@ fn parse_detail(mut args: Vec<String>) -> Result<Command, CliFailure> {
   } else if let Some(symbol) = take_value(&mut args, "--mlir-symbol")? {
     EntityHandle::MlirSymbol {
       symbol: parse_usize_arg(&symbol, "--mlir-symbol")?,
+    }
+  } else if let Some(attribute) = take_value(&mut args, "--mlir-attribute")? {
+    EntityHandle::MlirAttribute {
+      scope: required_scope(scope.as_deref(), "--mlir-attribute")?,
+      attribute: parse_usize_arg(&attribute, "--mlir-attribute")?,
     }
   } else {
     return Err(CliFailure::invalid("detail requires a handle selector").with_command("detail"));
@@ -692,10 +728,28 @@ fn parse_onnx(mut args: Vec<String>) -> Result<Command, CliFailure> {
 
 fn parse_serve(mut args: Vec<String>) -> Result<Command, CliFailure> {
   args.remove(0);
-  match args.as_slice() {
-    [] => Ok(Command::ServeStdio),
-    [flag] if flag == "--stdio" => Ok(Command::ServeStdio),
-    _ => Err(CliFailure::invalid("serve supports only --stdio").with_command("serve")),
+  if args.is_empty() || (args.len() == 1 && args[0] == "--stdio") {
+    return Ok(Command::ServeStdio);
+  }
+  if !take_flag(&mut args, "--http") {
+    return Err(
+      CliFailure::invalid("serve supports --stdio or --http [--listen <addr>]")
+        .with_command("serve"),
+    );
+  }
+  let listen = take_value(&mut args, "--listen")?.unwrap_or_else(|| {
+    if args.len() == 1 && !args[0].starts_with('-') {
+      args.remove(0)
+    } else {
+      "127.0.0.1:0".to_owned()
+    }
+  });
+  if args.is_empty() {
+    Ok(Command::ServeHttp { listen })
+  } else {
+    Err(
+      CliFailure::invalid("serve --http accepts at most one listen address").with_command("serve"),
+    )
   }
 }
 
@@ -725,6 +779,11 @@ fn parse_usize_arg(value: &str, name: &str) -> Result<usize, CliFailure> {
     .map_err(|_| CliFailure::invalid(format!("{name} must be a non-negative integer")))
 }
 
+fn parse_collapse_arg(value: &str) -> Result<CollapseMode, CliFailure> {
+  CollapseMode::parse(value)
+    .ok_or_else(|| CliFailure::invalid("--collapse must be 'none' or 'structural'"))
+}
+
 fn parse_function_selector(value: String) -> FunctionSelector {
   value
     .parse::<usize>()
@@ -744,9 +803,10 @@ fn layout_scope(
 ) -> Result<LayoutRequest, CliFailure> {
   match selector {
     LayoutSelector::Graph(graph) => Ok(LayoutRequest::Layout(EntityHandle::Graph { graph })),
-    LayoutSelector::Node { graph, node } => {
-      Ok(LayoutRequest::Slice(EntityHandle::Node { graph, node }))
-    }
+    LayoutSelector::Node { graph, node, depth } => Ok(LayoutRequest::Slice {
+      handle: EntityHandle::Node { graph, node },
+      depth,
+    }),
     LayoutSelector::MlirFunction {
       function: FunctionSelector::Index(function),
       region,
@@ -799,19 +859,7 @@ fn find_mlir_function(session: &ModelSession, name: &str) -> Result<EntityHandle
 
 struct MappedModel {
   path: PathBuf,
-  data: ModelData,
-}
-
-enum ModelData {
-  Mapped(Mmap),
-}
-
-impl AsRef<[u8]> for ModelData {
-  fn as_ref(&self) -> &[u8] {
-    match self {
-      Self::Mapped(data) => data,
-    }
-  }
+  data: Mmap,
 }
 
 impl MappedModel {
@@ -825,7 +873,7 @@ impl MappedModel {
     }
     let file = File::open(path)?;
     // SAFETY: the mmap is read-only and lives as long as every borrowed parser input.
-    let data = ModelData::Mapped(unsafe { Mmap::map(&file)? });
+    let data = unsafe { Mmap::map(&file)? };
     Ok(Self {
       path: path.to_owned(),
       data,
@@ -834,7 +882,7 @@ impl MappedModel {
 
   fn input(&self) -> ModelInput<'_> {
     ModelInput {
-      data: self.data.as_ref(),
+      data: &self.data,
       path: Some(self.path.as_path()),
       allow_unsafe_paths: false,
     }
@@ -845,11 +893,11 @@ impl MappedModel {
   }
 
   fn bytes(&self) -> &[u8] {
-    self.data.as_ref()
+    &self.data
   }
 
   fn len(&self) -> usize {
-    self.data.as_ref().len()
+    self.data.len()
   }
 }
 
@@ -911,6 +959,14 @@ struct Benchmark {
   json_ms_last: f64,
   layout_ms_last: f64,
   search_index_ms_last: f64,
+  session_open_ms_last: f64,
+  summary_ms_last: f64,
+  summary_json_bytes_last: usize,
+  search_ms_last: f64,
+  tensor_metadata_ms_last: f64,
+  session_layout_ms_last: f64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  peak_rss_kb_last: Option<u64>,
   parse_and_json_ms_last: f64,
   parse_json_layout_ms_last: f64,
   time_to_first_graph_ms_last: f64,
@@ -941,6 +997,33 @@ impl Benchmark {
     let search_index_start = Instant::now();
     let _index = netron_rs_query::ModelIndex::build(&model);
     let search_index_ms_last = search_index_start.elapsed().as_secs_f64() * 1000.0;
+    let session_open_start = Instant::now();
+    let session = ModelSession::open(mapped.bytes(), mapped.source())?;
+    let session_open_ms_last = session_open_start.elapsed().as_secs_f64() * 1000.0;
+    let limits = SessionLimits::default();
+    let summary_start = Instant::now();
+    let summary = session.summary(&limits);
+    let summary_ms_last = summary_start.elapsed().as_secs_f64() * 1000.0;
+    let summary_json_bytes_last = serde_json::to_vec(&summary)
+      .map_err(CliFailure::from)?
+      .len();
+    let search_start = Instant::now();
+    let search_query = if summary.format == FormatKind::Mlir {
+      "func"
+    } else {
+      "add"
+    };
+    let _hits = session.search(search_query, &limits);
+    let search_ms_last = search_start.elapsed().as_secs_f64() * 1000.0;
+    let tensor_metadata_start = Instant::now();
+    let _tensor_metadata = session.tensor_metadata(&limits);
+    let tensor_metadata_ms_last = tensor_metadata_start.elapsed().as_secs_f64() * 1000.0;
+    let session_layout_start = Instant::now();
+    if let Some(handle) = benchmark_layout_handle(&summary) {
+      let _layout = session.layout(&handle, &limits);
+    }
+    let session_layout_ms_last = session_layout_start.elapsed().as_secs_f64() * 1000.0;
+    let peak_rss_kb_last = peak_rss_kb();
     let stats = ModelStats::from_model(&model, mapped.len());
     let parse_ms_min = parse_times.iter().copied().fold(f64::INFINITY, f64::min);
     let parse_ms_max = parse_times
@@ -965,10 +1048,56 @@ impl Benchmark {
       json_ms_last,
       layout_ms_last,
       search_index_ms_last,
+      session_open_ms_last,
+      summary_ms_last,
+      summary_json_bytes_last,
+      search_ms_last,
+      tensor_metadata_ms_last,
+      session_layout_ms_last,
+      peak_rss_kb_last,
       parse_and_json_ms_last: parse_ms_last + json_ms_last,
       parse_json_layout_ms_last: parse_ms_last + json_ms_last + layout_ms_last,
       time_to_first_graph_ms_last: parse_ms_last + layout_ms_last,
       stats,
     })
   }
+}
+
+#[cfg(unix)]
+fn peak_rss_kb() -> Option<u64> {
+  let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+  let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+  if status != 0 {
+    return None;
+  }
+  let usage = unsafe { usage.assume_init() };
+  if usage.ru_maxrss <= 0 {
+    return None;
+  }
+  let max_rss = usage.ru_maxrss as u64;
+  #[cfg(target_os = "macos")]
+  {
+    Some(max_rss.div_ceil(1024))
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    Some(max_rss)
+  }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_kb() -> Option<u64> {
+  None
+}
+
+fn benchmark_layout_handle(summary: &netron_rs_query::SessionSummary) -> Option<EntityHandle> {
+  if summary.format == FormatKind::Onnx && summary.graphs > 0 {
+    return Some(EntityHandle::Graph { graph: 0 });
+  }
+  let mlir = summary.mlir.as_ref()?;
+  mlir
+    .functions
+    .first()
+    .map(|function| function.handle.clone())
+    .or_else(|| mlir.modules.first().map(|module| module.handle.clone()))
 }

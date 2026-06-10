@@ -379,7 +379,6 @@ impl Model {
   fn validate_attribute(&self, attribute: &Attribute) -> Result<(), ModelError> {
     self.validate_string_id(attribute.name, "attribute name")?;
     match &attribute.value {
-      AttributeValue::Null => {}
       AttributeValue::String(value) => self.validate_string_id(*value, "attribute string")?,
       AttributeValue::Reference(value) => self.validate_string_id(*value, "attribute reference")?,
       AttributeValue::Tensor(value) => self.validate_tensor_id(*value, "attribute tensor")?,
@@ -407,7 +406,8 @@ impl Model {
       | AttributeValue::Ints(_)
       | AttributeValue::Type(_)
       | AttributeValue::TypeList(_)
-      | AttributeValue::Unsupported(_) => {}
+      | AttributeValue::Unsupported(_)
+      | AttributeValue::Null => {}
     }
     Ok(())
   }
@@ -492,6 +492,7 @@ pub struct Function {
 pub struct FunctionValue {
   pub name: StringId,
   pub type_info: Option<TypeInfo>,
+  pub metadata: BTreeMap<String, String>,
   pub initializer: Option<TensorId>,
 }
 

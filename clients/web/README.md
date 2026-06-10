@@ -14,6 +14,12 @@ The UI is overview-first:
 - the request log is visible so smoke tests can prove no `export` request happens
   before an explicit export workflow exists.
 
-`index.html` can be opened directly for a demo transport. In VS Code, the
-extension injects the same `styles.css` and `viewer.mjs` files into a webview and
-proxies messages to `netron-rs serve --stdio`.
+`index.html` can be opened directly for a demo transport. For a live local
+service, start `netron-rs serve --http 127.0.0.1:0`, then open:
+
+```text
+index.html?endpoint=http://127.0.0.1:<port>&token=<token>&path=/path/to/model.onnx
+```
+
+In VS Code, the extension injects the same `styles.css` and `viewer.mjs` files
+into a webview and proxies messages to `netron-rs serve --stdio`.

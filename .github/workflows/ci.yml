@@ -30,3 +30,8 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --locked
+
+      - name: Benchmark smoke gate
+        run: |
+          mkdir -p artifacts/ci
+          node tools/fixture-smoke.mjs --output artifacts/ci/fixture-smoke.json

@@ -1,4 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+  collections::{BTreeMap, BTreeSet, VecDeque},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+};
 
 use netron_rs_core::{Graph, Model, Node, Value};
 use serde::Serialize;
@@ -8,6 +14,23 @@ use thiserror::Error;
 pub enum LayoutError {
   #[error("graph {graph} does not resolve; model has {graphs} graph(s)")]
   UnknownGraph { graph: usize, graphs: usize },
+  #[error("layout canceled")]
+  Canceled,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+  canceled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+  pub fn cancel(&self) {
+    self.canceled.store(true, Ordering::SeqCst);
+  }
+
+  pub fn is_canceled(&self) -> bool {
+    self.canceled.load(Ordering::SeqCst)
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +41,7 @@ pub struct LayoutOptions {
   pub direction: LayoutDirection,
   pub rank_spacing: f32,
   pub node_spacing: f32,
+  pub cancel: Option<CancellationToken>,
 }
 
 impl Default for LayoutOptions {
@@ -29,6 +53,7 @@ impl Default for LayoutOptions {
       direction: LayoutDirection::LeftToRight,
       rank_spacing: 260.0,
       node_spacing: 96.0,
+      cancel: None,
     }
   }
 }
@@ -82,6 +107,7 @@ pub enum LayoutNodeKind {
   Initializer,
   Operator,
   GraphOutput,
+  Group,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +149,7 @@ pub fn layout_model(model: &Model, options: &LayoutOptions) -> Result<LayoutMode
 }
 
 pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGraph, LayoutError> {
+  check_canceled(options.cancel.as_ref())?;
   let graph = model
     .graphs
     .get(options.graph)
@@ -132,7 +159,8 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
     })?;
 
   let visible = visible_operators(graph, options.max_nodes);
-  let rank_plan = rank_operators(graph, &visible);
+  check_canceled(options.cancel.as_ref())?;
+  let rank_plan = rank_operators(graph, &visible, options.cancel.as_ref())?;
   let mut nodes = Vec::new();
   let mut input_nodes = BTreeMap::new();
   let mut initializer_nodes = BTreeMap::new();
@@ -140,6 +168,7 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
   let mut output_nodes = BTreeMap::new();
 
   for value in &graph.inputs {
+    check_canceled(options.cancel.as_ref())?;
     let value = &graph.values[value.index()];
     let node_index = push_node(
       &mut nodes,
@@ -161,6 +190,7 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
       .iter()
       .filter(|value| value.initializer.is_some() && has_visible_consumer(value, &visible))
     {
+      check_canceled(options.cancel.as_ref())?;
       let node_index = push_node(
         &mut nodes,
         LayoutNode::boundary(
@@ -177,6 +207,7 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
   }
 
   for node in graph.nodes.iter().filter(|node| visible[node.id.index()]) {
+    check_canceled(options.cancel.as_ref())?;
     let rank = rank_plan.ranks[node.id.index()];
     let node_index = push_node(
       &mut nodes,
@@ -193,6 +224,7 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
   }
 
   for value_id in &graph.outputs {
+    check_canceled(options.cancel.as_ref())?;
     let value = &graph.values[value_id.index()];
     let rank = source_rank(value, &rank_plan.ranks, &visible).unwrap_or(rank_plan.max_rank) + 1;
     let node_index = push_node(
@@ -209,7 +241,9 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
     output_nodes.insert(value.id.index(), node_index);
   }
 
+  check_canceled(options.cancel.as_ref())?;
   position_nodes(&mut nodes, options);
+  check_canceled(options.cancel.as_ref())?;
 
   let mut stats = LayoutStats {
     omitted_nodes: graph.nodes.len() - visible.iter().filter(|visible| **visible).count(),
@@ -228,8 +262,10 @@ pub fn layout_graph(model: &Model, options: &LayoutOptions) -> Result<LayoutGrap
       output_nodes: &output_nodes,
       nodes: &nodes,
     },
+    options.cancel.as_ref(),
     &mut stats,
-  );
+  )?;
+  check_canceled(options.cancel.as_ref())?;
   stats.nodes_used = nodes.len();
   stats.edges_used = edges.len();
 
@@ -310,20 +346,6 @@ impl LayoutNode {
       hidden_initializers,
     }
   }
-
-  fn center_left(&self) -> LayoutPoint {
-    LayoutPoint {
-      x: self.x,
-      y: self.y + self.height / 2.0,
-    }
-  }
-
-  fn center_right(&self) -> LayoutPoint {
-    LayoutPoint {
-      x: self.x + self.width,
-      y: self.y + self.height / 2.0,
-    }
-  }
 }
 
 fn push_node(nodes: &mut Vec<LayoutNode>, node: LayoutNode) -> usize {
@@ -334,12 +356,14 @@ fn push_node(nodes: &mut Vec<LayoutNode>, node: LayoutNode) -> usize {
 
 fn visible_operators(graph: &Graph, max_nodes: Option<usize>) -> Vec<bool> {
   let limit = max_nodes.unwrap_or(usize::MAX);
-  graph
-    .nodes
-    .iter()
-    .enumerate()
-    .map(|(index, _)| index < limit)
-    .collect()
+  (0..graph.nodes.len()).map(|index| index < limit).collect()
+}
+
+fn check_canceled(cancel: Option<&CancellationToken>) -> Result<(), LayoutError> {
+  if cancel.is_some_and(CancellationToken::is_canceled) {
+    return Err(LayoutError::Canceled);
+  }
+  Ok(())
 }
 
 struct RankPlan {
@@ -348,10 +372,15 @@ struct RankPlan {
   cycles_detected: usize,
 }
 
-fn rank_operators(graph: &Graph, visible: &[bool]) -> RankPlan {
+fn rank_operators(
+  graph: &Graph,
+  visible: &[bool],
+  cancel: Option<&CancellationToken>,
+) -> Result<RankPlan, LayoutError> {
   let mut outgoing = vec![BTreeSet::new(); graph.nodes.len()];
   let mut indegree = vec![0usize; graph.nodes.len()];
   for value in &graph.values {
+    check_canceled(cancel)?;
     let Some(producer) = value.producer else {
       continue;
     };
@@ -371,6 +400,7 @@ fn rank_operators(graph: &Graph, visible: &[bool]) -> RankPlan {
   let mut ranks = vec![1usize; graph.nodes.len()];
   let mut queue = VecDeque::new();
   for node in &graph.nodes {
+    check_canceled(cancel)?;
     if visible[node.id.index()] && indegree[node.id.index()] == 0 {
       queue.push_back(node.id.index());
     }
@@ -378,6 +408,7 @@ fn rank_operators(graph: &Graph, visible: &[bool]) -> RankPlan {
 
   let mut visited = 0usize;
   while let Some(node) = queue.pop_front() {
+    check_canceled(cancel)?;
     visited += 1;
     for next in &outgoing[node] {
       ranks[*next] = ranks[*next].max(ranks[node] + 1);
@@ -397,11 +428,11 @@ fn rank_operators(graph: &Graph, visible: &[bool]) -> RankPlan {
     .map(|node| ranks[node.id.index()])
     .max()
     .unwrap_or(0);
-  RankPlan {
+  Ok(RankPlan {
     ranks,
     max_rank,
     cycles_detected,
-  }
+  })
 }
 
 fn source_rank(value: &Value, ranks: &[usize], visible: &[bool]) -> Option<usize> {
@@ -470,9 +501,14 @@ fn position_nodes(nodes: &mut [LayoutNode], options: &LayoutOptions) {
   }
 }
 
-fn build_edges(context: EdgeBuildContext<'_>, stats: &mut LayoutStats) -> Vec<LayoutEdge> {
+fn build_edges(
+  context: EdgeBuildContext<'_>,
+  cancel: Option<&CancellationToken>,
+  stats: &mut LayoutStats,
+) -> Result<Vec<LayoutEdge>, LayoutError> {
   let mut edges = Vec::new();
   for value in &context.graph.values {
+    check_canceled(cancel)?;
     let source = source_node(
       value,
       context.visible,
@@ -481,11 +517,11 @@ fn build_edges(context: EdgeBuildContext<'_>, stats: &mut LayoutStats) -> Vec<La
       context.operator_nodes,
     );
     for consumer in &value.consumers {
+      check_canceled(cancel)?;
       if let Some(target) = context.operator_nodes[consumer.index()] {
         if let Some(source) = source {
           edges.push(make_edge(
             context.model,
-            context.graph,
             value,
             source,
             target,
@@ -500,10 +536,10 @@ fn build_edges(context: EdgeBuildContext<'_>, stats: &mut LayoutStats) -> Vec<La
       }
     }
     if let Some(target) = context.output_nodes.get(&value.id.index()).copied() {
+      check_canceled(cancel)?;
       if let Some(source) = source {
         edges.push(make_edge(
           context.model,
-          context.graph,
           value,
           source,
           target,
@@ -515,7 +551,7 @@ fn build_edges(context: EdgeBuildContext<'_>, stats: &mut LayoutStats) -> Vec<La
       }
     }
   }
-  edges
+  Ok(edges)
 }
 
 fn source_node(
@@ -538,31 +574,31 @@ fn source_node(
 
 fn make_edge(
   model: &Model,
-  graph: &Graph,
   value: &Value,
   source: usize,
   target: usize,
   nodes: &[LayoutNode],
   edge_index: usize,
 ) -> LayoutEdge {
-  let from = nodes[source].id.clone();
-  let to = nodes[target].id.clone();
   LayoutEdge {
     id: format!("edge:{}:{edge_index}", value.id.index()),
     value: value.id.index(),
-    name: model
-      .strings
-      .get(graph.values[value.id.index()].name)
-      .to_owned(),
-    from,
-    to,
+    name: model.strings.get(value.name).to_owned(),
+    from: nodes[source].id.clone(),
+    to: nodes[target].id.clone(),
     points: route(&nodes[source], &nodes[target]),
   }
 }
 
 fn route(source: &LayoutNode, target: &LayoutNode) -> Vec<LayoutPoint> {
-  let start = source.center_right();
-  let end = target.center_left();
+  let start = LayoutPoint {
+    x: source.x + source.width,
+    y: source.y + source.height / 2.0,
+  };
+  let end = LayoutPoint {
+    x: target.x,
+    y: target.y + target.height / 2.0,
+  };
   let middle = (start.x + end.x) / 2.0;
   vec![
     start,
@@ -693,6 +729,23 @@ mod tests {
         .count(),
       2
     );
+  }
+
+  #[test]
+  fn canceled_layout_returns_canceled_error() {
+    let model = fixture_model(false);
+    let cancel = CancellationToken::default();
+    cancel.cancel();
+    let error = layout_graph(
+      &model,
+      &LayoutOptions {
+        cancel: Some(cancel),
+        ..LayoutOptions::default()
+      },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, LayoutError::Canceled));
   }
 
   fn fixture_model(with_initializer: bool) -> Model {

@@ -3,12 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Serializer, ser::SerializeMap};
 
 use crate::{
-  AttributeValue, Dimension, DimensionValue, Function, FunctionNode, FunctionValue, Graph, GraphId,
-  Model, Node, Tensor, TensorElementType, TensorStorage, TypeInfo, Value,
+  Attribute, AttributeValue, Dimension, DimensionValue, Function, FunctionNode, FunctionValue,
+  Graph, GraphId, Model, Node, Operator, Tensor, TensorElementType, TensorStorage, TypeInfo, Value,
 };
 
 pub trait ToNormalizedJson {
   fn to_normalized(&self) -> NormalizedModel<'_>;
+
+  fn to_bounded_normalized(&self, limit: usize) -> BoundedNormalizedModel<'_>;
 
   fn to_normalized_json(&self) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&self.to_normalized())
@@ -17,45 +19,24 @@ pub trait ToNormalizedJson {
 
 impl ToNormalizedJson for Model {
   fn to_normalized(&self) -> NormalizedModel<'_> {
-    NormalizedModel {
-      format: NormalizedFormat {
-        name: self.format.name,
-        version: self.format.version.as_deref(),
-      },
-      metadata: NormalizedMetadata {
-        producer: self.metadata.producer.as_deref(),
-        producer_version: self.metadata.producer_version.as_deref(),
-        domain: self.metadata.domain.as_deref(),
-        model_version: self.metadata.model_version,
-        description: self.metadata.description.as_deref(),
-        opsets: self
-          .metadata
-          .opsets
-          .iter()
-          .map(|opset| NormalizedOperatorSet {
-            domain: opset.domain.as_deref(),
-            version: opset.version,
-          })
-          .collect(),
-        properties: &self.metadata.properties,
-      },
-      graphs: self
-        .graphs
-        .iter()
-        .map(|graph| normalize_graph(self, graph))
-        .collect(),
-      functions: self
-        .functions
-        .iter()
-        .map(|function| normalize_function(self, function))
-        .collect(),
-      tensors: self
-        .tensors
-        .iter()
-        .map(|tensor| normalize_tensor(self, tensor))
-        .collect(),
+    let mut limiter = NormalizationLimiter::unbounded();
+    normalize_model(self, &mut limiter)
+  }
+
+  fn to_bounded_normalized(&self, limit: usize) -> BoundedNormalizedModel<'_> {
+    let mut limiter = NormalizationLimiter::bounded(limit);
+    let normalized = normalize_model(self, &mut limiter);
+    BoundedNormalizedModel {
+      normalized,
+      omitted_count: limiter.omitted_count(),
     }
   }
+}
+
+#[derive(Debug)]
+pub struct BoundedNormalizedModel<'a> {
+  pub normalized: NormalizedModel<'a>,
+  pub omitted_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +154,8 @@ pub struct NormalizedFunction<'a> {
 #[derive(Debug, Serialize)]
 pub struct NormalizedFunctionValue<'a> {
   pub name: &'a str,
+  #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+  pub metadata: &'a BTreeMap<String, String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub r#type: Option<NormalizedType<'a>>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,38 +381,115 @@ pub enum NormalizedTensorStorage<'a> {
   },
 }
 
-fn normalize_graph<'a>(model: &'a Model, graph: &'a Graph) -> NormalizedGraph<'a> {
+#[derive(Debug)]
+struct NormalizationLimiter {
+  limit: usize,
+  omitted_count: usize,
+}
+
+impl NormalizationLimiter {
+  fn unbounded() -> Self {
+    Self {
+      limit: usize::MAX,
+      omitted_count: 0,
+    }
+  }
+
+  fn bounded(limit: usize) -> Self {
+    Self {
+      limit,
+      omitted_count: 0,
+    }
+  }
+
+  fn omitted_count(&self) -> usize {
+    self.omitted_count
+  }
+
+  fn keep_len(&mut self, len: usize) -> usize {
+    let keep = len.min(self.limit);
+    self.omitted_count += len - keep;
+    keep
+  }
+
+  fn collect_slice<'a, T, U, F>(&mut self, items: &'a [T], mut map: F) -> Vec<U>
+  where
+    F: FnMut(&mut Self, &'a T) -> U,
+  {
+    let keep = self.keep_len(items.len());
+    items
+      .iter()
+      .take(keep)
+      .map(|item| map(self, item))
+      .collect()
+  }
+}
+
+fn normalize_model<'a>(
+  model: &'a Model,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedModel<'a> {
+  NormalizedModel {
+    format: NormalizedFormat {
+      name: model.format.name,
+      version: model.format.version.as_deref(),
+    },
+    metadata: NormalizedMetadata {
+      producer: model.metadata.producer.as_deref(),
+      producer_version: model.metadata.producer_version.as_deref(),
+      domain: model.metadata.domain.as_deref(),
+      model_version: model.metadata.model_version,
+      description: model.metadata.description.as_deref(),
+      opsets: limiter.collect_slice(&model.metadata.opsets, |_, opset| NormalizedOperatorSet {
+        domain: opset.domain.as_deref(),
+        version: opset.version,
+      }),
+      properties: &model.metadata.properties,
+    },
+    graphs: limiter.collect_slice(&model.graphs, |limiter, graph| {
+      normalize_graph(model, graph, limiter)
+    }),
+    functions: limiter.collect_slice(&model.functions, |limiter, function| {
+      normalize_function(model, function, limiter)
+    }),
+    tensors: limiter.collect_slice(&model.tensors, |limiter, tensor| {
+      normalize_tensor(model, tensor, limiter)
+    }),
+  }
+}
+
+fn normalize_graph<'a>(
+  model: &'a Model,
+  graph: &'a Graph,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedGraph<'a> {
   NormalizedGraph {
     id: graph.id.index(),
     parent: graph.parent.map(GraphId::index),
     name: graph.name.map(|id| model.strings.get(id)),
     description: graph.description.as_deref(),
     metadata: &graph.metadata,
-    inputs: graph
-      .inputs
-      .iter()
-      .map(|id| model.strings.get(graph.values[id.index()].name))
-      .collect(),
-    outputs: graph
-      .outputs
-      .iter()
-      .map(|id| model.strings.get(graph.values[id.index()].name))
-      .collect(),
-    values: graph
-      .values
-      .iter()
-      .map(|value| normalize_value(model, value))
-      .collect(),
-    nodes: graph
-      .nodes
-      .iter()
-      .map(|node| normalize_node(model, graph, node))
-      .collect(),
-    subgraphs: graph.subgraphs.iter().map(|id| id.index()).collect(),
+    inputs: limiter.collect_slice(&graph.inputs, |_, id| {
+      model.strings.get(graph.values[id.index()].name)
+    }),
+    outputs: limiter.collect_slice(&graph.outputs, |_, id| {
+      model.strings.get(graph.values[id.index()].name)
+    }),
+    values: limiter.collect_slice(&graph.values, |limiter, value| {
+      normalize_value(model, value, limiter)
+    }),
+    nodes: limiter.collect_slice(&graph.nodes, |limiter, node| {
+      normalize_node(model, graph, node, limiter)
+    }),
+    subgraphs: limiter.collect_slice(&graph.subgraphs, |_, id| id.index()),
   }
 }
 
-fn normalize_value<'a>(model: &'a Model, value: &'a Value) -> NormalizedValue<'a> {
+fn normalize_value<'a>(
+  model: &'a Model,
+  value: &'a Value,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedValue<'a> {
   NormalizedValue {
     id: value.id.index(),
     name: model.strings.get(value.name),
@@ -438,110 +498,82 @@ fn normalize_value<'a>(model: &'a Model, value: &'a Value) -> NormalizedValue<'a
     r#type: value
       .type_info
       .as_ref()
-      .map(|type_info| normalize_type(model, type_info)),
+      .map(|type_info| normalize_type(model, type_info, limiter)),
     producer: value.producer.map(|id| id.index()),
-    consumers: value.consumers.iter().map(|id| id.index()).collect(),
+    consumers: limiter.collect_slice(&value.consumers, |_, id| id.index()),
     initializer: value.initializer.map(|id| id.index()),
-    quantization: value
-      .quantization
-      .iter()
-      .map(|entry| NormalizedQuantizationAnnotation {
+    quantization: limiter.collect_slice(&value.quantization, |_, entry| {
+      NormalizedQuantizationAnnotation {
         key: model.strings.get(entry.key),
         value: model.strings.get(entry.value),
-      })
-      .collect(),
+      }
+    }),
     graph_input: value.is_graph_input,
     graph_output: value.is_graph_output,
   }
 }
 
-fn normalize_node<'a>(model: &'a Model, graph: &'a Graph, node: &'a Node) -> NormalizedNode<'a> {
+fn normalize_node<'a>(
+  model: &'a Model,
+  graph: &'a Graph,
+  node: &'a Node,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedNode<'a> {
   NormalizedNode {
     id: node.id.index(),
     name: node.name.map(|id| model.strings.get(id)),
     description: node.description.as_deref(),
     metadata: &node.metadata,
-    operator: NormalizedOperator {
-      domain: node.operator.domain.map(|id| model.strings.get(id)),
-      name: model.strings.get(node.operator.name),
-      overload: node.operator.overload.map(|id| model.strings.get(id)),
-      version: node.operator.version,
-      origin: node.operator.origin,
-    },
-    inputs: node
-      .inputs
-      .iter()
-      .map(|id| id.map(|id| model.strings.get(graph.values[id.index()].name)))
-      .collect(),
-    outputs: node
-      .outputs
-      .iter()
-      .map(|id| id.map(|id| model.strings.get(graph.values[id.index()].name)))
-      .collect(),
-    attributes: node
-      .attributes
-      .iter()
-      .map(|attribute| NormalizedAttribute {
-        name: model.strings.get(attribute.name),
-        value: normalize_attribute_value(model, &attribute.value),
-      })
-      .collect(),
+    operator: normalize_operator(model, &node.operator),
+    inputs: limiter.collect_slice(&node.inputs, |_, id| {
+      id.map(|id| model.strings.get(graph.values[id.index()].name))
+    }),
+    outputs: limiter.collect_slice(&node.outputs, |_, id| {
+      id.map(|id| model.strings.get(graph.values[id.index()].name))
+    }),
+    attributes: normalize_attributes(model, &node.attributes, limiter),
   }
 }
 
-fn normalize_function<'a>(model: &'a Model, function: &'a Function) -> NormalizedFunction<'a> {
+fn normalize_function<'a>(
+  model: &'a Model,
+  function: &'a Function,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedFunction<'a> {
   NormalizedFunction {
     name: model.strings.get(function.name),
     domain: function.domain.map(|id| model.strings.get(id)),
     overload: function.overload.map(|id| model.strings.get(id)),
     description: function.description.as_deref(),
     metadata: &function.metadata,
-    opsets: function
-      .opsets
-      .iter()
-      .map(|opset| NormalizedOperatorSet {
-        domain: opset.domain.as_deref(),
-        version: opset.version,
-      })
-      .collect(),
-    inputs: function
-      .inputs
-      .iter()
-      .map(|id| model.strings.get(*id))
-      .collect(),
-    outputs: function
-      .outputs
-      .iter()
-      .map(|id| model.strings.get(*id))
-      .collect(),
-    attributes: function
-      .attributes
-      .iter()
-      .map(|id| model.strings.get(*id))
-      .collect(),
-    values: function
-      .values
-      .iter()
-      .map(|value| normalize_function_value(model, value))
-      .collect(),
-    nodes: function
-      .nodes
-      .iter()
-      .map(|node| normalize_function_node(model, node))
-      .collect(),
+    opsets: limiter.collect_slice(&function.opsets, |_, opset| NormalizedOperatorSet {
+      domain: opset.domain.as_deref(),
+      version: opset.version,
+    }),
+    inputs: limiter.collect_slice(&function.inputs, |_, id| model.strings.get(*id)),
+    outputs: limiter.collect_slice(&function.outputs, |_, id| model.strings.get(*id)),
+    attributes: limiter.collect_slice(&function.attributes, |_, id| model.strings.get(*id)),
+    values: limiter.collect_slice(&function.values, |limiter, value| {
+      normalize_function_value(model, value, limiter)
+    }),
+    nodes: limiter.collect_slice(&function.nodes, |limiter, node| {
+      normalize_function_node(model, node, limiter)
+    }),
   }
 }
 
 fn normalize_function_value<'a>(
   model: &'a Model,
   value: &'a FunctionValue,
+  limiter: &mut NormalizationLimiter,
 ) -> NormalizedFunctionValue<'a> {
   NormalizedFunctionValue {
     name: model.strings.get(value.name),
+    metadata: &value.metadata,
     r#type: value
       .type_info
       .as_ref()
-      .map(|type_info| normalize_type(model, type_info)),
+      .map(|type_info| normalize_type(model, type_info, limiter)),
     initializer: value.initializer.map(|id| id.index()),
   }
 }
@@ -549,42 +581,44 @@ fn normalize_function_value<'a>(
 fn normalize_function_node<'a>(
   model: &'a Model,
   node: &'a FunctionNode,
+  limiter: &mut NormalizationLimiter,
 ) -> NormalizedFunctionNode<'a> {
   NormalizedFunctionNode {
     name: node.name.map(|id| model.strings.get(id)),
     description: node.description.as_deref(),
     metadata: &node.metadata,
-    operator: NormalizedOperator {
-      domain: node.operator.domain.map(|id| model.strings.get(id)),
-      name: model.strings.get(node.operator.name),
-      overload: node.operator.overload.map(|id| model.strings.get(id)),
-      version: node.operator.version,
-      origin: node.operator.origin,
-    },
-    inputs: node
-      .inputs
-      .iter()
-      .map(|id| id.map(|id| model.strings.get(id)))
-      .collect(),
-    outputs: node
-      .outputs
-      .iter()
-      .map(|id| id.map(|id| model.strings.get(id)))
-      .collect(),
-    attributes: node
-      .attributes
-      .iter()
-      .map(|attribute| NormalizedAttribute {
-        name: model.strings.get(attribute.name),
-        value: normalize_attribute_value(model, &attribute.value),
-      })
-      .collect(),
+    operator: normalize_operator(model, &node.operator),
+    inputs: limiter.collect_slice(&node.inputs, |_, id| id.map(|id| model.strings.get(id))),
+    outputs: limiter.collect_slice(&node.outputs, |_, id| id.map(|id| model.strings.get(id))),
+    attributes: normalize_attributes(model, &node.attributes, limiter),
   }
+}
+
+fn normalize_operator<'a>(model: &'a Model, operator: &'a Operator) -> NormalizedOperator<'a> {
+  NormalizedOperator {
+    domain: operator.domain.map(|id| model.strings.get(id)),
+    name: model.strings.get(operator.name),
+    overload: operator.overload.map(|id| model.strings.get(id)),
+    version: operator.version,
+    origin: operator.origin,
+  }
+}
+
+fn normalize_attributes<'a>(
+  model: &'a Model,
+  attributes: &'a [Attribute],
+  limiter: &mut NormalizationLimiter,
+) -> Vec<NormalizedAttribute<'a>> {
+  limiter.collect_slice(attributes, |limiter, attribute| NormalizedAttribute {
+    name: model.strings.get(attribute.name),
+    value: normalize_attribute_value(model, &attribute.value, limiter),
+  })
 }
 
 fn normalize_attribute_value<'a>(
   model: &'a Model,
   value: &'a AttributeValue,
+  limiter: &mut NormalizationLimiter,
 ) -> NormalizedAttributeValue<'a> {
   match value {
     AttributeValue::Null => NormalizedAttributeValue::Null,
@@ -600,37 +634,43 @@ fn normalize_attribute_value<'a>(
     },
     AttributeValue::Tensor(value) => NormalizedAttributeValue::Tensor(value.index()),
     AttributeValue::Graph(value) => NormalizedAttributeValue::Graph(value.index()),
-    AttributeValue::Floats(value) => NormalizedAttributeValue::Floats(value.clone()),
-    AttributeValue::Ints(value) => NormalizedAttributeValue::Ints(value.clone()),
-    AttributeValue::Strings(value) => {
-      NormalizedAttributeValue::Strings(value.iter().map(|id| model.strings.get(*id)).collect())
+    AttributeValue::Floats(value) => {
+      NormalizedAttributeValue::Floats(limiter.collect_slice(value, |_, value| *value))
     }
+    AttributeValue::Ints(value) => {
+      NormalizedAttributeValue::Ints(limiter.collect_slice(value, |_, value| *value))
+    }
+    AttributeValue::Strings(value) => NormalizedAttributeValue::Strings(
+      limiter.collect_slice(value, |_, id| model.strings.get(*id)),
+    ),
     AttributeValue::Tensors(value) => {
-      NormalizedAttributeValue::Tensors(value.iter().map(|id| id.index()).collect())
+      NormalizedAttributeValue::Tensors(limiter.collect_slice(value, |_, id| id.index()))
     }
     AttributeValue::Graphs(value) => {
-      NormalizedAttributeValue::Graphs(value.iter().map(|id| id.index()).collect())
+      NormalizedAttributeValue::Graphs(limiter.collect_slice(value, |_, id| id.index()))
     }
     AttributeValue::Type(value) => NormalizedAttributeValue::Type(value),
     AttributeValue::TypeList(value) => {
-      NormalizedAttributeValue::TypeList(value.iter().map(String::as_str).collect())
+      NormalizedAttributeValue::TypeList(limiter.collect_slice(value, |_, value| value.as_str()))
     }
     AttributeValue::Unsupported(value) => NormalizedAttributeValue::Unsupported(value),
   }
 }
 
-fn normalize_tensor<'a>(model: &'a Model, tensor: &'a Tensor) -> NormalizedTensor<'a> {
+fn normalize_tensor<'a>(
+  model: &'a Model,
+  tensor: &'a Tensor,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedTensor<'a> {
   NormalizedTensor {
     id: tensor.id.index(),
     name: tensor.name.map(|id| model.strings.get(id)),
     description: tensor.description.as_deref(),
     metadata: &tensor.metadata,
     element_type: element_type_name(&tensor.element_type),
-    shape: tensor
-      .shape
-      .iter()
-      .map(|dimension| normalize_dimension(model, dimension))
-      .collect(),
+    shape: limiter.collect_slice(&tensor.shape, |_, dimension| {
+      normalize_dimension(model, dimension)
+    }),
     storage: match &tensor.storage {
       TensorStorage::Absent => NormalizedTensorStorage::Absent,
       TensorStorage::InlineBytes { byte_len } => NormalizedTensorStorage::InlineBytes {
@@ -647,16 +687,18 @@ fn normalize_tensor<'a>(model: &'a Model, tensor: &'a Tensor) -> NormalizedTenso
   }
 }
 
-fn normalize_type<'a>(model: &'a Model, value: &'a TypeInfo) -> NormalizedType<'a> {
+fn normalize_type<'a>(
+  model: &'a Model,
+  value: &'a TypeInfo,
+  limiter: &mut NormalizationLimiter,
+) -> NormalizedType<'a> {
   NormalizedType {
     element_type: value.element_type.as_ref().map(element_type_name),
     layout: value.layout.map(|id| model.strings.get(id)),
     denotation: value.denotation.map(|id| model.strings.get(id)),
-    shape: value
-      .shape
-      .iter()
-      .map(|dimension| normalize_dimension(model, dimension))
-      .collect(),
+    shape: limiter.collect_slice(&value.shape, |_, dimension| {
+      normalize_dimension(model, dimension)
+    }),
   }
 }
 

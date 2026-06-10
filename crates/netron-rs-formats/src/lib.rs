@@ -175,4 +175,8 @@ fn access_denied(source: Option<&Path>, location: &str) -> ModelError {
   }
 }
 
+pub use mlir::{
+  MlirBytecodeIrSummary, MlirBytecodeResource, MlirBytecodeSection, MlirBytecodeSummary,
+  inspect_mlir_bytecode,
+};
 pub use netron_rs_core::{ModelInput, ToNormalizedJson};

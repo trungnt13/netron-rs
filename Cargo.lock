@@ -96,6 +96,7 @@ dependencies = [
 name = "netron-rs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "netron-rs-core",
  "netron-rs-formats",

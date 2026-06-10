@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
 memmap2.workspace = true
 netron-rs-core = { version = "0.1.0", path = "../netron-rs-core" }
 netron-rs-formats = { version = "0.1.0", path = "../netron-rs-formats" }

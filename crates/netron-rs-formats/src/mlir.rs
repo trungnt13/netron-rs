@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+  collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+  fmt::Write as _,
+};
 
 use netron_rs_core::{
   Attribute, AttributeValue, Confidence, Dimension, FormatInfo, FormatMetadata, Function,
   FunctionNode, FunctionValue, Graph, Model, ModelError, ModelFormat, ModelInput, Node, Operator,
   Tensor, TensorElementType, TensorStorage, TypeInfo, Value, ValueId,
 };
+use serde::Serialize;
 
 use crate::validate_external_path;
 
@@ -68,7 +72,7 @@ impl ModelFormat for MlirFormat {
       .map_err(|error| invalid(format!("MLIR text is not UTF-8: {error}")))?;
     let parsed = parse_text(text);
     validate_external_resource_paths(input.path, &parsed, input.allow_unsafe_paths)?;
-    lower_model(parsed)
+    Ok(lower_model(parsed))
   }
 }
 
@@ -76,6 +80,289 @@ const MLIR_BYTECODE_MAGIC: &[u8; 4] = b"ML\xEFR";
 
 fn is_mlir_bytecode(data: &[u8]) -> bool {
   data.starts_with(MLIR_BYTECODE_MAGIC)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeSummary {
+  pub version: u64,
+  pub producer: String,
+  pub string_count: usize,
+  pub dialects: Vec<String>,
+  pub operation_names: Vec<String>,
+  pub resources: Vec<MlirBytecodeResource>,
+  pub sections: Vec<MlirBytecodeSection>,
+  pub locations: Vec<MlirBytecodeLocation>,
+  pub attribute_count: usize,
+  pub attributes: Vec<MlirBytecodeAttribute>,
+  pub type_count: usize,
+  pub types: Vec<MlirBytecodeType>,
+  pub property_count: usize,
+  pub properties: Vec<MlirBytecodeProperty>,
+  pub ir: MlirBytecodeIrSummary,
+  pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeSection {
+  pub id: u8,
+  pub len: usize,
+  pub alignment: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeResource {
+  pub scope: String,
+  pub name: String,
+  pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeLocation {
+  pub attribute: usize,
+  pub kind: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub file: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub line: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub column: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub end_line: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub end_column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeProperty {
+  pub index: usize,
+  pub len: usize,
+  #[serde(skip_serializing_if = "String::is_empty")]
+  pub preview_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeAttribute {
+  pub index: usize,
+  pub dialect: String,
+  pub has_custom_encoding: bool,
+  pub len: usize,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub assembly: Option<String>,
+  #[serde(skip_serializing_if = "String::is_empty")]
+  pub preview_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeType {
+  pub index: usize,
+  pub dialect: String,
+  pub has_custom_encoding: bool,
+  pub len: usize,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub assembly: Option<String>,
+  #[serde(skip_serializing_if = "String::is_empty")]
+  pub preview_hex: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MlirBytecodeIrSummary {
+  pub operation_names: Vec<String>,
+  pub operations: Vec<MlirBytecodeOperationSummary>,
+  pub values: Vec<MlirBytecodeValueSummary>,
+  pub operation_count: usize,
+  pub module_count: usize,
+  pub function_count: usize,
+  pub region_count: usize,
+  pub block_count: usize,
+  pub value_count: usize,
+  pub block_argument_count: usize,
+  pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeOperationSummary {
+  pub name: String,
+  pub operation: usize,
+  pub region: usize,
+  pub block: usize,
+  pub location: Option<usize>,
+  pub attributes: Option<usize>,
+  pub properties: Option<usize>,
+  pub operands: Vec<usize>,
+  pub results: Vec<usize>,
+  pub nested_regions: usize,
+  #[serde(skip_serializing_if = "Vec::is_empty")]
+  pub nested_region_ids: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MlirBytecodeValueSummary {
+  pub value: usize,
+  pub kind: String,
+  pub region: usize,
+  pub block: usize,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub operation: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub type_index: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub location: Option<usize>,
+}
+
+pub fn inspect_mlir_bytecode(data: &[u8]) -> Result<Option<MlirBytecodeSummary>, ModelError> {
+  if !is_mlir_bytecode(data) {
+    return Ok(None);
+  }
+  BytecodeParser::new(data)
+    .parse()
+    .map(|summary| Some(summary.into()))
+}
+
+impl From<BytecodeSummary> for MlirBytecodeSummary {
+  fn from(summary: BytecodeSummary) -> Self {
+    Self {
+      version: summary.version,
+      producer: summary.producer,
+      string_count: summary.strings.len(),
+      dialects: summary
+        .dialects
+        .iter()
+        .map(|dialect| dialect.name.clone())
+        .collect(),
+      operation_names: summary.operations,
+      resources: summary.resources.into_iter().map(Into::into).collect(),
+      sections: summary.sections.into_iter().map(Into::into).collect(),
+      locations: summary.locations.into_iter().map(Into::into).collect(),
+      attribute_count: summary.attribute_count,
+      attributes: summary.attributes.into_iter().map(Into::into).collect(),
+      type_count: summary.type_count,
+      types: summary.types.into_iter().map(Into::into).collect(),
+      property_count: summary.property_count,
+      properties: summary.properties.into_iter().map(Into::into).collect(),
+      ir: summary.ir.into(),
+      diagnostics: summary.diagnostics,
+    }
+  }
+}
+
+impl From<BytecodeSection> for MlirBytecodeSection {
+  fn from(section: BytecodeSection) -> Self {
+    Self {
+      id: section.id,
+      len: section.len,
+      alignment: section.alignment,
+    }
+  }
+}
+
+impl From<BytecodeResource> for MlirBytecodeResource {
+  fn from(resource: BytecodeResource) -> Self {
+    Self {
+      scope: resource.scope,
+      name: resource.name,
+      kind: resource.kind,
+    }
+  }
+}
+
+impl From<BytecodeLocation> for MlirBytecodeLocation {
+  fn from(location: BytecodeLocation) -> Self {
+    Self {
+      attribute: location.attribute,
+      kind: location.kind.to_owned(),
+      file: location.file,
+      line: location.line,
+      column: location.column,
+      end_line: location.end_line,
+      end_column: location.end_column,
+    }
+  }
+}
+
+impl From<BytecodeProperty> for MlirBytecodeProperty {
+  fn from(property: BytecodeProperty) -> Self {
+    Self {
+      index: property.index,
+      len: property.len,
+      preview_hex: property.preview_hex,
+    }
+  }
+}
+
+impl From<BytecodeAttribute> for MlirBytecodeAttribute {
+  fn from(attribute: BytecodeAttribute) -> Self {
+    Self {
+      index: attribute.index,
+      dialect: attribute.dialect,
+      has_custom_encoding: attribute.has_custom_encoding,
+      len: attribute.len,
+      assembly: attribute.assembly,
+      preview_hex: attribute.preview_hex,
+    }
+  }
+}
+
+impl From<BytecodeType> for MlirBytecodeType {
+  fn from(entry: BytecodeType) -> Self {
+    Self {
+      index: entry.index,
+      dialect: entry.dialect,
+      has_custom_encoding: entry.has_custom_encoding,
+      len: entry.len,
+      assembly: entry.assembly,
+      preview_hex: entry.preview_hex,
+    }
+  }
+}
+
+impl From<BytecodeIrSummary> for MlirBytecodeIrSummary {
+  fn from(summary: BytecodeIrSummary) -> Self {
+    Self {
+      operation_names: summary.operation_names,
+      operations: summary.operations.into_iter().map(Into::into).collect(),
+      values: summary.values.into_iter().map(Into::into).collect(),
+      operation_count: summary.operation_count,
+      module_count: summary.module_count,
+      function_count: summary.function_count,
+      region_count: summary.region_count,
+      block_count: summary.block_count,
+      value_count: summary.value_count,
+      block_argument_count: summary.block_argument_count,
+      truncated: summary.truncated,
+    }
+  }
+}
+
+impl From<BytecodeIrValue> for MlirBytecodeValueSummary {
+  fn from(value: BytecodeIrValue) -> Self {
+    Self {
+      value: value.value,
+      kind: value.kind.to_owned(),
+      region: value.region,
+      block: value.block,
+      operation: value.operation,
+      type_index: value.type_index,
+      location: value.location,
+    }
+  }
+}
+
+impl From<BytecodeIrOperation> for MlirBytecodeOperationSummary {
+  fn from(operation: BytecodeIrOperation) -> Self {
+    Self {
+      name: operation.name,
+      operation: operation.operation,
+      region: operation.region,
+      block: operation.block,
+      location: operation.location,
+      attributes: operation.attributes,
+      properties: operation.properties,
+      operands: operation.operands,
+      results: operation.results,
+      nested_regions: operation.nested_regions,
+      nested_region_ids: operation.nested_region_ids,
+    }
+  }
 }
 
 #[derive(Debug)]
@@ -87,9 +374,13 @@ struct BytecodeSummary {
   operations: Vec<String>,
   resources: Vec<BytecodeResource>,
   sections: Vec<BytecodeSection>,
+  attributes: Vec<BytecodeAttribute>,
+  locations: Vec<BytecodeLocation>,
   attribute_count: usize,
   type_count: usize,
+  types: Vec<BytecodeType>,
   property_count: usize,
+  properties: Vec<BytecodeProperty>,
   ir: BytecodeIrSummary,
   diagnostics: Vec<String>,
 }
@@ -119,7 +410,7 @@ struct BytecodeSection {
   alignment: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BytecodeResource {
   scope: String,
   name: String,
@@ -127,8 +418,57 @@ struct BytecodeResource {
 }
 
 #[derive(Debug, Default)]
+struct BytecodeResources {
+  resources: Vec<BytecodeResource>,
+  handles: Vec<BytecodeResource>,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeLocation {
+  attribute: usize,
+  kind: &'static str,
+  file: Option<String>,
+  line: Option<usize>,
+  column: Option<usize>,
+  end_line: Option<usize>,
+  end_column: Option<usize>,
+  assembly: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeProperty {
+  index: usize,
+  len: usize,
+  data: Vec<u8>,
+  preview_hex: String,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeAttribute {
+  index: usize,
+  dialect: String,
+  has_custom_encoding: bool,
+  len: usize,
+  string: Option<String>,
+  assembly: Option<String>,
+  preview_hex: String,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeType {
+  index: usize,
+  dialect: String,
+  has_custom_encoding: bool,
+  len: usize,
+  assembly: Option<String>,
+  preview_hex: String,
+}
+
+#[derive(Debug, Default)]
 struct BytecodeIrSummary {
   operation_names: Vec<String>,
+  operations: Vec<BytecodeIrOperation>,
+  values: Vec<BytecodeIrValue>,
   operation_count: usize,
   module_count: usize,
   function_count: usize,
@@ -139,117 +479,55 @@ struct BytecodeIrSummary {
   truncated: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BytecodeIrOperation {
+  name: String,
+  operation: usize,
+  region: usize,
+  block: usize,
+  location: Option<usize>,
+  attributes: Option<usize>,
+  properties: Option<usize>,
+  operands: Vec<usize>,
+  results: Vec<usize>,
+  nested_regions: usize,
+  nested_region_ids: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct BytecodeIrValue {
+  value: usize,
+  kind: &'static str,
+  region: usize,
+  block: usize,
+  operation: Option<usize>,
+  type_index: Option<usize>,
+  location: Option<usize>,
+}
+
 fn parse_bytecode(data: &[u8]) -> Result<Model, ModelError> {
   let summary = BytecodeParser::new(data).parse()?;
+  let decoded_locations = summary
+    .locations
+    .iter()
+    .map(|location| (location.attribute, location))
+    .collect::<BTreeMap<_, _>>();
   let mut model = Model::new(FormatInfo {
     name: FORMAT,
     version: Some(format!("Bytecode v{}", summary.version)),
   });
   model.metadata.producer = Some(summary.producer.clone());
   model.metadata.producer_version = Some(format!("bytecode {}", summary.version));
-  model
-    .metadata
-    .properties
-    .insert("bytecode.version".to_owned(), summary.version.to_string());
-  model
-    .metadata
-    .properties
-    .insert("bytecode.producer".to_owned(), summary.producer.clone());
-  model.metadata.properties.insert(
-    "bytecode.string_count".to_owned(),
-    summary.strings.len().to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.attribute_count".to_owned(),
-    summary.attribute_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.type_count".to_owned(),
-    summary.type_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.resource_count".to_owned(),
-    summary.resources.len().to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.property_count".to_owned(),
-    summary.property_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.sections".to_owned(),
-    bytecode_sections_text(&summary.sections),
-  );
-  model.metadata.properties.insert(
-    "bytecode.dialects".to_owned(),
-    summary
-      .dialects
-      .iter()
-      .map(|dialect| dialect.name.as_str())
-      .collect::<Vec<_>>()
-      .join(","),
-  );
-  model.metadata.properties.insert(
-    "bytecode.operation_name_count".to_owned(),
-    summary.operations.len().to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_operation_count".to_owned(),
-    summary.ir.operation_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_module_count".to_owned(),
-    summary.ir.module_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_function_count".to_owned(),
-    summary.ir.function_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_region_count".to_owned(),
-    summary.ir.region_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_block_count".to_owned(),
-    summary.ir.block_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_value_count".to_owned(),
-    summary.ir.value_count.to_string(),
-  );
-  model.metadata.properties.insert(
-    "bytecode.ir_block_argument_count".to_owned(),
-    summary.ir.block_argument_count.to_string(),
-  );
-  if summary.ir.truncated {
-    model
-      .metadata
-      .properties
-      .insert("bytecode.ir_truncated".to_owned(), "true".to_owned());
-  }
-  for (index, resource) in summary.resources.iter().enumerate() {
-    model.metadata.properties.insert(
-      format!("bytecode.resource.{index}.scope"),
-      resource.scope.clone(),
-    );
-    model.metadata.properties.insert(
-      format!("bytecode.resource.{index}.name"),
-      resource.name.clone(),
-    );
-    model.metadata.properties.insert(
-      format!("bytecode.resource.{index}.kind"),
-      resource.kind.clone(),
-    );
-  }
-  for (index, diagnostic) in summary.diagnostics.iter().enumerate() {
-    model
-      .metadata
-      .properties
-      .insert(format!("bytecode.diagnostic.{index}"), diagnostic.clone());
-  }
 
-  let graph_name = model.intern("bytecode");
-  let graph_id = model.add_graph_placeholder(None, Some(graph_name));
-  let mut graph = Graph::new(graph_id, None, Some(graph_name));
+  let module_name = decoded_bytecode_module_name(&summary);
+  let module_name_id = module_name.as_ref().map(|name| model.intern(name));
+  let graph_id = model.add_graph_placeholder(None, module_name_id);
+  let mut graph = Graph::new(graph_id, None, module_name_id);
+  if let Some(module_name) = &module_name {
+    graph
+      .metadata
+      .insert("bytecode.symbol".to_owned(), module_name.clone());
+  }
   graph.metadata.insert(
     "bytecode.summary".to_owned(),
     "MLIR bytecode operation summary; dialect-specific attributes are lazy metadata".to_owned(),
@@ -274,24 +552,235 @@ fn parse_bytecode(data: &[u8]) -> Result<Model, ModelError> {
   if operations.is_empty() {
     operations.push("bytecode.module".to_owned());
   }
-  for operation in &operations {
-    let operator = Operator {
-      domain: None,
-      name: model.intern(operation),
-      overload: None,
-      version: None,
-      origin: FORMAT,
-    };
-    graph.add_node(Node::new(graph_id, operator));
+  let mut referenced_values = BTreeSet::new();
+  for operation in &summary.ir.operations {
+    for value in operation.operands.iter().chain(&operation.results).copied() {
+      if referenced_values.len() >= BYTECODE_IR_VALUE_LIMIT {
+        break;
+      }
+      referenced_values.insert(value);
+    }
+    if referenced_values.len() >= BYTECODE_IR_VALUE_LIMIT {
+      break;
+    }
   }
+  let display_value_names = bytecode_display_value_names(&summary.ir.values);
+  let value_names = referenced_values
+    .into_iter()
+    .map(|value| {
+      let fallback;
+      let name = if let Some(name) = display_value_names.get(&value) {
+        name.as_str()
+      } else {
+        fallback = bytecode_value_name(value);
+        fallback.as_str()
+      };
+      (value, model.intern(name))
+    })
+    .collect::<BTreeMap<_, _>>();
+  let value_info = summary
+    .ir
+    .values
+    .iter()
+    .map(|value| (value.value, value))
+    .collect::<BTreeMap<_, _>>();
+  let type_assembly = summary
+    .types
+    .iter()
+    .filter_map(|entry| {
+      entry
+        .assembly
+        .as_ref()
+        .map(|assembly| (entry.index, assembly))
+    })
+    .collect::<BTreeMap<_, _>>();
+  let function_names = decoded_bytecode_function_names(&summary);
+  let module_operator = Operator {
+    domain: None,
+    name: model.intern("bytecode.module"),
+    overload: None,
+    version: None,
+    origin: FORMAT,
+  };
+  graph.add_node(Node::new(graph_id, module_operator));
   model.replace_graph(graph_id, graph);
   for index in 0..summary
     .ir
     .function_count
     .min(BYTECODE_FUNCTION_SUMMARY_LIMIT)
   {
-    let function_name = format!("bytecode.func.{index}");
+    let function_name = function_names
+      .get(index)
+      .and_then(|name| name.as_deref())
+      .map(str::to_owned)
+      .unwrap_or_else(|| format!("bytecode.func.{index}"));
     let name = model.intern(&function_name);
+    let nodes = if index == 0 {
+      if summary.ir.operations.is_empty() {
+        operations
+          .iter()
+          .map(|operation| FunctionNode {
+            name: None,
+            description: None,
+            metadata: BTreeMap::new(),
+            operator: Operator {
+              domain: None,
+              name: model.intern(operation),
+              overload: None,
+              version: None,
+              origin: FORMAT,
+            },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            attributes: Vec::new(),
+          })
+          .collect()
+      } else {
+        summary
+          .ir
+          .operations
+          .iter()
+          .map(|operation| {
+            let mut metadata = BTreeMap::from([
+              (
+                "bytecode.operation".to_owned(),
+                operation.operation.to_string(),
+              ),
+              ("bytecode.region".to_owned(), operation.region.to_string()),
+              ("bytecode.block".to_owned(), operation.block.to_string()),
+              (
+                "bytecode.nested_regions".to_owned(),
+                operation.nested_regions.to_string(),
+              ),
+            ]);
+            if let Some(location) = operation.location {
+              metadata.insert("bytecode.location".to_owned(), location.to_string());
+              if let Some(decoded) = decoded_locations.get(&location) {
+                if let Some(file) = &decoded.file {
+                  metadata.insert("bytecode.location.file".to_owned(), file.clone());
+                }
+                if let Some(line) = decoded.line {
+                  metadata.insert("bytecode.location.line".to_owned(), line.to_string());
+                }
+                if let Some(column) = decoded.column {
+                  metadata.insert("bytecode.location.column".to_owned(), column.to_string());
+                }
+                if let Some(end_line) = decoded.end_line {
+                  metadata.insert(
+                    "bytecode.location.end_line".to_owned(),
+                    end_line.to_string(),
+                  );
+                }
+                if let Some(end_column) = decoded.end_column {
+                  metadata.insert(
+                    "bytecode.location.end_column".to_owned(),
+                    end_column.to_string(),
+                  );
+                }
+              }
+            }
+            if let Some(attributes) = operation.attributes {
+              metadata.insert("bytecode.attributes".to_owned(), attributes.to_string());
+              if let Some(assembly) = summary
+                .attributes
+                .get(attributes)
+                .and_then(|attribute| attribute.assembly.as_ref())
+              {
+                metadata.insert(
+                  "bytecode.attributes.assembly".to_owned(),
+                  bytecode_metadata_preview(assembly),
+                );
+              }
+            }
+            if let Some(properties) = operation.properties {
+              metadata.insert("bytecode.properties".to_owned(), properties.to_string());
+              if let Some(property) = summary.properties.get(properties) {
+                metadata.insert(
+                  "bytecode.properties.size".to_owned(),
+                  property.len.to_string(),
+                );
+                if !property.preview_hex.is_empty() {
+                  metadata.insert(
+                    "bytecode.properties.preview_hex".to_owned(),
+                    property.preview_hex.clone(),
+                  );
+                }
+              }
+            }
+            for (name, value) in decode_bytecode_operation_string_properties(
+              operation,
+              &summary.properties,
+              &summary.attributes,
+            ) {
+              metadata.insert(format!("bytecode.property.{name}"), value);
+            }
+            for (name, value) in decode_bytecode_operation_intrinsic_metadata(operation) {
+              metadata.insert(format!("bytecode.{name}"), value);
+            }
+            if let Some(symbol) =
+              decode_bytecode_operation_symbol(operation, &summary.properties, &summary.attributes)
+            {
+              metadata.insert("bytecode.symbol".to_owned(), symbol);
+            }
+            if !operation.nested_region_ids.is_empty() {
+              metadata.insert(
+                "bytecode.nested_region_ids".to_owned(),
+                operation
+                  .nested_region_ids
+                  .iter()
+                  .map(usize::to_string)
+                  .collect::<Vec<_>>()
+                  .join(","),
+              );
+            }
+            FunctionNode {
+              name: None,
+              description: None,
+              metadata,
+              operator: Operator {
+                domain: None,
+                name: model.intern(&operation.name),
+                overload: None,
+                version: None,
+                origin: FORMAT,
+              },
+              inputs: operation
+                .operands
+                .iter()
+                .filter_map(|value| value_names.get(value).copied().map(Some))
+                .collect(),
+              outputs: operation
+                .results
+                .iter()
+                .filter_map(|value| value_names.get(value).copied().map(Some))
+                .collect(),
+              attributes: Vec::new(),
+            }
+          })
+          .collect()
+      }
+    } else {
+      Vec::new()
+    };
+    let values = if index == 0 {
+      let mut values = Vec::new();
+      for (value, name) in &value_names {
+        let info = value_info.get(value).copied();
+        let assembly = info
+          .and_then(|info| info.type_index)
+          .and_then(|type_index| type_assembly.get(&type_index).copied());
+        let assembly_text = assembly.map(String::as_str);
+        values.push(FunctionValue {
+          name: *name,
+          type_info: assembly_text.and_then(|assembly| parse_type_info(&mut model, Some(assembly))),
+          metadata: bytecode_value_metadata(*value, info, assembly_text),
+          initializer: None,
+        });
+      }
+      values
+    } else {
+      Vec::new()
+    };
     model.add_function(Function {
       name,
       domain: None,
@@ -302,8 +791,8 @@ fn parse_bytecode(data: &[u8]) -> Result<Model, ModelError> {
       inputs: Vec::new(),
       outputs: Vec::new(),
       attributes: Vec::new(),
-      values: Vec::new(),
-      nodes: Vec::new(),
+      values,
+      nodes,
     });
   }
   if summary.ir.function_count > BYTECODE_FUNCTION_SUMMARY_LIMIT {
@@ -315,15 +804,163 @@ fn parse_bytecode(data: &[u8]) -> Result<Model, ModelError> {
   Ok(model)
 }
 
-fn bytecode_sections_text(sections: &[BytecodeSection]) -> String {
-  sections
+fn decoded_bytecode_function_names(summary: &BytecodeSummary) -> Vec<Option<String>> {
+  summary
+    .ir
+    .operations
     .iter()
-    .map(|section| match section.alignment {
-      Some(alignment) => format!("{}:{}@{}", section.id, section.len, alignment),
-      None => format!("{}:{}", section.id, section.len),
+    .filter(|operation| is_function_start_token(&operation.name))
+    .map(|operation| {
+      decode_bytecode_func_symbol(operation, &summary.properties, &summary.attributes)
     })
-    .collect::<Vec<_>>()
-    .join(",")
+    .collect()
+}
+
+fn decoded_bytecode_module_name(summary: &BytecodeSummary) -> Option<String> {
+  summary.ir.operations.iter().find_map(|operation| {
+    decode_bytecode_module_symbol(operation, &summary.properties, &summary.attributes)
+  })
+}
+
+fn decode_bytecode_operation_symbol(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  decode_bytecode_func_symbol(operation, properties, attributes)
+    .or_else(|| decode_bytecode_module_symbol(operation, properties, attributes))
+    .or_else(|| decode_bytecode_torch_operator_name(operation, properties, attributes))
+    .or_else(|| decode_bytecode_func_constant_symbol(operation, properties, attributes))
+    .or_else(|| decode_bytecode_util_global_symbol(operation, properties, attributes))
+}
+
+fn decode_bytecode_operation_string_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  match operation.name.as_str() {
+    "arith.constant" => {
+      decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+        .map(|value| vec![("value", value)])
+        .unwrap_or_default()
+    }
+    "builtin.module" => decode_bytecode_module_properties(operation, properties, attributes),
+    "func.func" => decode_bytecode_func_properties(operation, properties, attributes),
+    "func.call" => decode_bytecode_func_call_properties(operation, properties, attributes),
+    "func.constant" => {
+      decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+        .map(|value| vec![("value", value)])
+        .unwrap_or_default()
+    }
+    "torch.operator" => decode_bytecode_torch_operator_name(operation, properties, attributes)
+      .map(|name| vec![("name", name)])
+      .unwrap_or_default(),
+    "torch.constant.bool"
+    | "torch.constant.device"
+    | "torch.constant.float"
+    | "torch.constant.int"
+    | "torch.constant.number"
+    | "torch.constant.str"
+    | "torch.vtensor.literal" => {
+      decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+        .map(|value| vec![("value", value)])
+        .unwrap_or_default()
+    }
+    "util.global" => decode_bytecode_util_global_properties(operation, properties, attributes),
+    "util.global.load" | "util.global.store" => {
+      decode_bytecode_util_global_ref_properties(operation, properties, attributes)
+    }
+    _ => Vec::new(),
+  }
+}
+
+fn decode_bytecode_operation_intrinsic_metadata(
+  operation: &BytecodeIrOperation,
+) -> Vec<(&'static str, String)> {
+  match operation.name.as_str() {
+    // Netron MLIR metadata defines torch.constant.none with no attributes and a
+    // single Torch_NoneType result; Netron's MLIR reader maps it to value null,
+    // type none. The string metadata keeps that singleton visible in bytecode
+    // sessions without inventing a property payload.
+    "torch.constant.none" => vec![
+      ("constant.value", "none".to_owned()),
+      ("constant.type", "none".to_owned()),
+    ],
+    _ => Vec::new(),
+  }
+}
+
+fn bytecode_display_value_names(values: &[BytecodeIrValue]) -> BTreeMap<usize, String> {
+  let mut names = BTreeMap::new();
+  let mut block_argument_offsets = BTreeMap::<(usize, usize), usize>::new();
+  let mut result = 0usize;
+  for value in values {
+    let name = match value.kind {
+      "block_argument" => {
+        let offset = block_argument_offsets
+          .entry((value.region, value.block))
+          .or_default();
+        let name = if value.region == 0 && value.block == 0 {
+          format!("%arg{}", *offset)
+        } else {
+          format!("%bb{}_arg{}", value.block, *offset)
+        };
+        *offset += 1;
+        name
+      }
+      "operation_result" => {
+        let name = format!("%{result}");
+        result += 1;
+        name
+      }
+      _ => bytecode_value_name(value.value),
+    };
+    names.insert(value.value, name);
+  }
+  names
+}
+
+fn bytecode_value_name(value: usize) -> String {
+  format!("bytecode.value.{value}")
+}
+
+fn bytecode_value_metadata(
+  value: usize,
+  info: Option<&BytecodeIrValue>,
+  type_assembly: Option<&str>,
+) -> BTreeMap<String, String> {
+  let mut metadata = BTreeMap::from([("bytecode.value".to_owned(), value.to_string())]);
+  if let Some(info) = info {
+    metadata.insert("bytecode.value.kind".to_owned(), info.kind.to_owned());
+    metadata.insert("bytecode.region".to_owned(), info.region.to_string());
+    metadata.insert("bytecode.block".to_owned(), info.block.to_string());
+    if let Some(operation) = info.operation {
+      metadata.insert("bytecode.operation".to_owned(), operation.to_string());
+    }
+    if let Some(type_index) = info.type_index {
+      metadata.insert("bytecode.type".to_owned(), type_index.to_string());
+    }
+    if let Some(type_assembly) = type_assembly {
+      metadata.insert(
+        "bytecode.type.assembly".to_owned(),
+        type_assembly.to_owned(),
+      );
+    }
+    if let Some(location) = info.location {
+      metadata.insert("bytecode.location".to_owned(), location.to_string());
+    }
+  }
+  metadata
+}
+
+fn bytecode_metadata_preview(value: &str) -> String {
+  const LIMIT: usize = 512;
+  let mut preview = value.chars().take(LIMIT).collect::<String>();
+  if preview.len() < value.len() {
+    preview.push_str("...");
+  }
+  preview
 }
 
 struct BytecodeParser<'a> {
@@ -384,7 +1021,27 @@ impl<'a> BytecodeParser<'a> {
       &strings,
       &dialects,
     )?;
-    let property_count = parse_property_count(section_data.get(8).and_then(|section| *section))?;
+    let attributes = parse_bytecode_attributes(
+      section_data.get(2).and_then(|section| *section),
+      section_data.get(3).and_then(|section| *section),
+      &strings,
+      &dialects,
+      &resources.handles,
+    )?;
+    let locations = parse_bytecode_locations(
+      section_data.get(2).and_then(|section| *section),
+      section_data.get(3).and_then(|section| *section),
+      &strings,
+      &dialects,
+    )?;
+    let types = parse_bytecode_types(
+      section_data.get(2).and_then(|section| *section),
+      section_data.get(3).and_then(|section| *section),
+      &strings,
+      &dialects,
+    )?;
+    let properties = parse_bytecode_properties(section_data.get(8).and_then(|section| *section))?;
+    let property_count = properties.len();
     let ir = match section_data.get(4).and_then(|section| *section) {
       Some(section) => {
         let op_names = dialects
@@ -415,11 +1072,15 @@ impl<'a> BytecodeParser<'a> {
       strings,
       dialects,
       operations,
-      resources,
+      resources: resources.resources,
       sections,
+      attributes,
+      locations,
       attribute_count,
       type_count,
+      types,
       property_count,
+      properties,
       ir,
       diagnostics,
     })
@@ -521,18 +1182,1693 @@ fn parse_attr_type_counts(section: Option<&[u8]>) -> Result<(usize, usize), Mode
   Ok((reader.read_usize()?, reader.read_usize()?))
 }
 
+struct BytecodeAttrTypeEntry<'a> {
+  dialect: &'a str,
+  has_custom_encoding: bool,
+  data: &'a [u8],
+}
+
+const BUILTIN_STRING_ATTR_KIND: usize = 2;
+const BUILTIN_STRING_ATTR_WITH_TYPE_KIND: usize = 3;
+const BUILTIN_FLAT_SYMBOL_REF_ATTR_KIND: usize = 4;
+const BUILTIN_SYMBOL_REF_ATTR_KIND: usize = 5;
+const BUILTIN_TYPE_ATTR_KIND: usize = 6;
+const BUILTIN_UNIT_ATTR_KIND: usize = 7;
+const BUILTIN_INTEGER_ATTR_KIND: usize = 8;
+const BUILTIN_FLOAT_ATTR_KIND: usize = 9;
+const BUILTIN_CALL_SITE_LOC_KIND: usize = 10;
+const BUILTIN_FILE_LINE_COL_LEGACY_OR_RANGE_KIND: usize = 11;
+const BUILTIN_FUSED_OR_FILE_LINE_COL_LOC_KIND: usize = 12;
+const BUILTIN_FUSED_LOC_WITH_METADATA_KIND: usize = 13;
+const BUILTIN_NAME_LOC_KIND: usize = 14;
+const BUILTIN_LEGACY_NAME_OR_UNKNOWN_LOC_KIND: usize = 15;
+const BUILTIN_DENSE_RESOURCE_ELEMENTS_ATTR_KIND: usize = 16;
+const BUILTIN_DENSE_ARRAY_ATTR_KIND: usize = 17;
+const BUILTIN_DENSE_INT_OR_FP_ELEMENTS_ATTR_KIND: usize = 18;
+const BUILTIN_DENSE_STRING_ELEMENTS_ATTR_KIND: usize = 19;
+const BUILTIN_SPARSE_ELEMENTS_ATTR_KIND: usize = 20;
+const BUILTIN_DISTINCT_ATTR_KIND: usize = 21;
+const BUILTIN_FILE_LINE_COL_RANGE_KIND: usize = 22;
+
+fn parse_bytecode_locations(
+  attr_type_section: Option<&[u8]>,
+  offset_section: Option<&[u8]>,
+  strings: &[String],
+  dialects: &[BytecodeDialect],
+) -> Result<Vec<BytecodeLocation>, ModelError> {
+  let (Some(attr_type_section), Some(offset_section)) = (attr_type_section, offset_section) else {
+    return Ok(Vec::new());
+  };
+  let attributes = parse_bytecode_attribute_entries(attr_type_section, offset_section, dialects)?;
+  let mut locations = Vec::new();
+  for attribute in 0..attributes.len() {
+    if let Some(location) = decode_builtin_location(attribute, &attributes, strings, 0) {
+      locations.push(location);
+    }
+  }
+  Ok(locations)
+}
+
+fn parse_bytecode_attribute_entries<'a>(
+  attr_type_section: &'a [u8],
+  offset_section: &'a [u8],
+  dialects: &'a [BytecodeDialect],
+) -> Result<Vec<BytecodeAttrTypeEntry<'a>>, ModelError> {
+  let mut reader = BytecodeCursor::new(offset_section);
+  let attribute_count = reader.read_usize()?;
+  let _type_count = reader.read_usize()?;
+  let mut offset = 0usize;
+  read_bytecode_attr_type_entries(
+    &mut reader,
+    attr_type_section,
+    dialects,
+    attribute_count,
+    &mut offset,
+    "attribute",
+  )
+}
+
+fn parse_bytecode_attributes(
+  attr_type_section: Option<&[u8]>,
+  offset_section: Option<&[u8]>,
+  strings: &[String],
+  dialects: &[BytecodeDialect],
+  resource_handles: &[BytecodeResource],
+) -> Result<Vec<BytecodeAttribute>, ModelError> {
+  let (Some(attr_type_section), Some(offset_section)) = (attr_type_section, offset_section) else {
+    return Ok(Vec::new());
+  };
+  let mut reader = BytecodeCursor::new(offset_section);
+  let attribute_count = reader.read_usize()?;
+  let type_count = reader.read_usize()?;
+  let mut offset = 0usize;
+  let attributes = read_bytecode_attr_type_entries(
+    &mut reader,
+    attr_type_section,
+    dialects,
+    attribute_count,
+    &mut offset,
+    "attribute",
+  )?;
+  let types = read_bytecode_attr_type_entries(
+    &mut reader,
+    attr_type_section,
+    dialects,
+    type_count,
+    &mut offset,
+    "type",
+  )?;
+  Ok(
+    attributes
+      .iter()
+      .enumerate()
+      .map(|(index, entry)| BytecodeAttribute {
+        index,
+        dialect: entry.dialect.to_owned(),
+        has_custom_encoding: entry.has_custom_encoding,
+        len: entry.data.len(),
+        string: decode_builtin_string_attr_entry(entry, strings),
+        assembly: decode_bytecode_attr_assembly(
+          index,
+          &attributes,
+          &types,
+          strings,
+          resource_handles,
+          0,
+        ),
+        preview_hex: hex_preview(entry.data, BYTECODE_ATTR_TYPE_PREVIEW_BYTES),
+      })
+      .collect(),
+  )
+}
+
+fn parse_bytecode_types(
+  attr_type_section: Option<&[u8]>,
+  offset_section: Option<&[u8]>,
+  strings: &[String],
+  dialects: &[BytecodeDialect],
+) -> Result<Vec<BytecodeType>, ModelError> {
+  let (Some(attr_type_section), Some(offset_section)) = (attr_type_section, offset_section) else {
+    return Ok(Vec::new());
+  };
+  let mut reader = BytecodeCursor::new(offset_section);
+  let attribute_count = reader.read_usize()?;
+  let type_count = reader.read_usize()?;
+  let mut offset = 0usize;
+  let attributes = read_bytecode_attr_type_entries(
+    &mut reader,
+    attr_type_section,
+    dialects,
+    attribute_count,
+    &mut offset,
+    "attribute",
+  )?;
+  let types = read_bytecode_attr_type_entries(
+    &mut reader,
+    attr_type_section,
+    dialects,
+    type_count,
+    &mut offset,
+    "type",
+  )?;
+  Ok(
+    types
+      .iter()
+      .enumerate()
+      .map(|(index, entry)| BytecodeType {
+        index,
+        dialect: entry.dialect.to_owned(),
+        has_custom_encoding: entry.has_custom_encoding,
+        len: entry.data.len(),
+        assembly: decode_bytecode_type_assembly(index, &types, &attributes, strings, 0),
+        preview_hex: hex_preview(entry.data, BYTECODE_ATTR_TYPE_PREVIEW_BYTES),
+      })
+      .collect(),
+  )
+}
+
+fn decode_bytecode_type_assembly(
+  index: usize,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  if depth > 32 {
+    return None;
+  }
+  let entry = types.get(index)?;
+  if !entry.has_custom_encoding {
+    return decode_bytecode_assembly_string(entry.data);
+  }
+  match entry.dialect {
+    "builtin" => decode_builtin_type_assembly(entry.data, types, attributes, strings, depth + 1),
+    "vhlo" => decode_vhlo_type_assembly(entry.data, types, attributes, strings, depth + 1),
+    _ => None,
+  }
+}
+
+fn decode_bytecode_assembly_string(data: &[u8]) -> Option<String> {
+  let data = data.strip_suffix(&[0])?;
+  std::str::from_utf8(data).ok().map(str::to_owned)
+}
+
+fn decode_bytecode_attr_assembly(
+  index: usize,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  if depth > 32 {
+    return None;
+  }
+  let entry = attributes.get(index)?;
+  if !entry.has_custom_encoding {
+    return decode_bytecode_assembly_string(entry.data);
+  }
+  match entry.dialect {
+    "builtin" => decode_builtin_attr_assembly(
+      index,
+      entry.data,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth + 1,
+    ),
+    "vhlo" => decode_vhlo_attr_assembly(
+      entry.data,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth + 1,
+    ),
+    _ => None,
+  }
+}
+
+fn decode_builtin_attr_assembly(
+  attribute: usize,
+  data: &[u8],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let mut reader = BytecodeCursor::new(data);
+  let kind = reader.read_usize().ok()?;
+  let assembly = match kind {
+    0 => {
+      let values = read_bytecode_attr_list(
+        &mut reader,
+        attributes,
+        types,
+        strings,
+        resource_handles,
+        depth,
+      )?;
+      format!("[{}]", values.join(", "))
+    }
+    1 => decode_builtin_dictionary_attr(
+      &mut reader,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    BUILTIN_STRING_ATTR_KIND => {
+      let value = read_bytecode_string(&mut reader, strings)?;
+      quote_bytecode_string(&value)
+    }
+    BUILTIN_STRING_ATTR_WITH_TYPE_KIND => {
+      let value = read_bytecode_string(&mut reader, strings)?;
+      let ty = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("{} : {ty}", quote_bytecode_string(&value))
+    }
+    BUILTIN_FLAT_SYMBOL_REF_ATTR_KIND => {
+      let symbol = read_bytecode_string_attr_ref(&mut reader, attributes, strings)?;
+      format!("@{symbol}")
+    }
+    BUILTIN_SYMBOL_REF_ATTR_KIND => decode_builtin_symbol_ref_attr(
+      &mut reader,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    BUILTIN_TYPE_ATTR_KIND => {
+      read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?
+    }
+    BUILTIN_UNIT_ATTR_KIND => "unit".to_owned(),
+    BUILTIN_INTEGER_ATTR_KIND => {
+      decode_builtin_integer_attr(&mut reader, attributes, types, strings, depth)?
+    }
+    BUILTIN_FLOAT_ATTR_KIND => {
+      decode_builtin_float_attr(&mut reader, attributes, types, strings, depth)?
+    }
+    BUILTIN_DENSE_RESOURCE_ELEMENTS_ATTR_KIND => decode_builtin_dense_resource_elements_attr(
+      &mut reader,
+      types,
+      attributes,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    BUILTIN_DENSE_ARRAY_ATTR_KIND => {
+      decode_builtin_dense_array_attr(&mut reader, types, attributes, strings, depth)?
+    }
+    BUILTIN_DENSE_INT_OR_FP_ELEMENTS_ATTR_KIND => {
+      decode_builtin_dense_int_or_fp_elements_attr(&mut reader, types, attributes, strings, depth)?
+    }
+    BUILTIN_DENSE_STRING_ELEMENTS_ATTR_KIND => {
+      decode_builtin_dense_string_elements_attr(&mut reader, types, attributes, strings, depth)?
+    }
+    BUILTIN_SPARSE_ELEMENTS_ATTR_KIND => decode_builtin_sparse_elements_attr(
+      &mut reader,
+      types,
+      attributes,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    BUILTIN_DISTINCT_ATTR_KIND => decode_builtin_distinct_attr(
+      &mut reader,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    BUILTIN_CALL_SITE_LOC_KIND
+    | BUILTIN_FILE_LINE_COL_LEGACY_OR_RANGE_KIND
+    | BUILTIN_FUSED_OR_FILE_LINE_COL_LOC_KIND
+    | BUILTIN_FUSED_LOC_WITH_METADATA_KIND
+    | BUILTIN_NAME_LOC_KIND
+    | BUILTIN_LEGACY_NAME_OR_UNKNOWN_LOC_KIND
+    | BUILTIN_FILE_LINE_COL_RANGE_KIND => {
+      let location = decode_builtin_location(attribute, attributes, strings, depth)?;
+      return Some(bytecode_location_assembly(&location));
+    }
+    _ => return None,
+  };
+  reader.is_empty().then_some(assembly)
+}
+
+fn decode_builtin_dictionary_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let count = reader.read_usize().ok()?;
+  let entries = (0..count)
+    .map(|_| {
+      let name = read_bytecode_string_attr_ref(reader, attributes, strings)?;
+      let value =
+        read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+      Some(format!("{name} = {value}"))
+    })
+    .collect::<Option<Vec<_>>>()?;
+  Some(format!("{{{}}}", entries.join(", ")))
+}
+
+fn decode_builtin_symbol_ref_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let root = read_bytecode_string_attr_ref(reader, attributes, strings)?;
+  let nested_count = reader.read_usize().ok()?;
+  let mut parts = Vec::with_capacity(nested_count + 1);
+  parts.push(format!("@{root}"));
+  for _ in 0..nested_count {
+    let symbol =
+      read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+    parts.push(symbol);
+  }
+  Some(parts.join("::"))
+}
+
+fn decode_builtin_integer_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let width = integer_type_width(&ty)?;
+  let value = if width <= 8 {
+    i64::from(reader.read_byte().ok()?)
+  } else if width <= 64 {
+    reader.read_signed().ok()?
+  } else {
+    return None;
+  };
+  Some(format!("{value} : {ty}"))
+}
+
+fn decode_builtin_float_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let width = float_type_width(&ty)?;
+  let bits = read_bytecode_apint_bits(reader, width)?;
+  let value = match width {
+    32 => f32::from_bits(bits as u32).to_string(),
+    64 => f64::from_bits(bits as u64).to_string(),
+    _ => format_bytecode_float_bits(bits, width),
+  };
+  Some(format!("{value} : {ty}"))
+}
+
+fn decode_builtin_dense_array_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let size = reader.read_usize().ok()?;
+  let blob = read_bytecode_blob(reader)?;
+  Some(format!("array<{ty}: {size} values, {} bytes>", blob.len()))
+}
+
+fn decode_builtin_dense_resource_elements_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let resource = resource_handles.get(reader.read_usize().ok()?)?;
+  Some(format!("dense_resource<{}> : {ty}", resource.name))
+}
+
+fn decode_builtin_dense_int_or_fp_elements_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let blob = read_bytecode_blob(reader)?;
+  let value =
+    bytecode_dense_numeric_preview(&ty, blob).unwrap_or_else(|| format!("{} bytes", blob.len()));
+  Some(format!("dense<{value}> : {ty}"))
+}
+
+fn decode_builtin_dense_string_elements_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let is_splat = reader.read_usize().ok()? != 0;
+  let count = reader.read_usize().ok()?;
+  let mut values = Vec::with_capacity(count.min(BYTECODE_DENSE_STRING_PREVIEW_VALUES));
+  for index in 0..count {
+    let value = read_bytecode_string(reader, strings)?;
+    if index < BYTECODE_DENSE_STRING_PREVIEW_VALUES {
+      values.push(quote_bytecode_string(&value));
+    }
+  }
+  let value = if is_splat && values.len() == 1 {
+    values[0].clone()
+  } else {
+    let mut values = values.join(", ");
+    if count > BYTECODE_DENSE_STRING_PREVIEW_VALUES {
+      if !values.is_empty() {
+        values.push_str(", ");
+      }
+      let _ = write!(
+        &mut values,
+        "... {} more",
+        count - BYTECODE_DENSE_STRING_PREVIEW_VALUES
+      );
+    }
+    format!("[{values}]")
+  };
+  Some(format!("dense<{value}> : {ty}"))
+}
+
+fn decode_builtin_sparse_elements_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let indices =
+    read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+  let values = read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+  Some(format!(
+    "sparse<indices = {indices}, values = {values}> : {ty}"
+  ))
+}
+
+fn decode_builtin_distinct_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let value = read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+  Some(format!("distinct<{value}>"))
+}
+
+fn decode_vhlo_attr_assembly(
+  data: &[u8],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let mut reader = BytecodeCursor::new(data);
+  let kind = reader.read_usize().ok()?;
+  let assembly = match kind {
+    1 => {
+      let values = read_bytecode_attr_list(
+        &mut reader,
+        attributes,
+        types,
+        strings,
+        resource_handles,
+        depth,
+      )?;
+      format!("[{}]", values.join(", "))
+    }
+    2 => (reader.read_usize().ok()? == 1).to_string(),
+    3 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["EQ", "NE", "GE", "GT", "LE", "LT"],
+      "comparison_direction",
+    )?,
+    4 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["NOTYPE", "FLOAT", "TOTALORDER", "SIGNED", "UNSIGNED"],
+      "comparison_type",
+    )?,
+    5 => format!("API_VERSION_{}", reader.read_usize().ok()?),
+    6 => decode_vhlo_dictionary_attr(
+      &mut reader,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    7 => decode_vhlo_enum_attr(&mut reader, &["FFT", "IFFT", "RFFT", "IRFFT"], "fft_type")?,
+    8 => decode_builtin_float_attr(&mut reader, attributes, types, strings, depth)?,
+    9 => decode_builtin_integer_attr(&mut reader, attributes, types, strings, depth)?,
+    10 => decode_vhlo_output_operand_alias_attr(&mut reader)?,
+    11 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["DEFAULT", "HIGH", "HIGHEST", "PACKED_NIBBLE"],
+      "precision",
+    )?,
+    12 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["DEFAULT", "THREE_FRY", "PHILOX"],
+      "rng_algorithm",
+    )?,
+    13 => decode_vhlo_enum_attr(&mut reader, &["UNIFORM", "NORMAL"], "rng_distribution")?,
+    14 => {
+      let value = read_bytecode_string(&mut reader, strings)?;
+      quote_bytecode_string(&value)
+    }
+    15 => decode_vhlo_tensor_attr(&mut reader, types, attributes, strings, depth)?,
+    16 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["TRANSPOSE", "NO_TRANSPOSE", "ADJOINT"],
+      "transpose",
+    )?,
+    17 => read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?,
+    18 => {
+      let bounds = read_bytecode_signed_list(&mut reader)?;
+      format!(
+        "type_extensions<bounds = [{}]>",
+        format_bytecode_i64_list(&bounds)
+      )
+    }
+    19 => decode_vhlo_enum_attr(
+      &mut reader,
+      &["DEFAULT", "HIGH", "HIGHEST", "TOLERANCE"],
+      "result_accuracy_mode",
+    )?,
+    20 => decode_vhlo_result_accuracy_attr(
+      &mut reader,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth,
+    )?,
+    _ => return None,
+  };
+  reader.is_empty().then_some(assembly)
+}
+
+fn decode_vhlo_dictionary_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let count = reader.read_usize().ok()?;
+  let entries = (0..count)
+    .map(|index| {
+      let name_index = reader.read_usize().ok()?;
+      let name = decode_bytecode_string_attr_value(name_index, attributes, strings)
+        .unwrap_or_else(|| format!("attr_{index}"));
+      let value =
+        read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+      Some(format!("{name} = {value}"))
+    })
+    .collect::<Option<Vec<_>>>()?;
+  Some(format!("{{{}}}", entries.join(", ")))
+}
+
+fn decode_vhlo_output_operand_alias_attr(reader: &mut BytecodeCursor<'_>) -> Option<String> {
+  let output_tuple_indices = read_bytecode_signed_list(reader)?;
+  let operand_index = reader.read_signed().ok()?;
+  let operand_tuple_indices = read_bytecode_signed_list(reader)?;
+  Some(format!(
+    "output_operand_alias<output_tuple_indices = [{}], operand_index = {operand_index}, operand_tuple_indices = [{}]>",
+    format_bytecode_i64_list(&output_tuple_indices),
+    format_bytecode_i64_list(&operand_tuple_indices)
+  ))
+}
+
+fn decode_vhlo_tensor_attr(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let ty = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let blob = read_bytecode_blob(reader)?;
+  let value =
+    bytecode_dense_numeric_preview(&ty, blob).unwrap_or_else(|| format!("{} bytes", blob.len()));
+  Some(format!("dense<{value}> : {ty}"))
+}
+
+fn decode_vhlo_result_accuracy_attr(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let atol = read_bytecode_f64(reader)?;
+  let rtol = read_bytecode_f64(reader)?;
+  let ulps = reader.read_signed().ok()?;
+  let mode = read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth)?;
+  Some(format!(
+    "result_accuracy<atol = {atol}, rtol = {rtol}, ulps = {ulps}, mode = {mode}>"
+  ))
+}
+
+fn decode_vhlo_enum_attr(
+  reader: &mut BytecodeCursor<'_>,
+  variants: &[&str],
+  fallback: &str,
+) -> Option<String> {
+  let value = reader.read_usize().ok()?;
+  Some(
+    variants
+      .get(value)
+      .map(|variant| (*variant).to_owned())
+      .unwrap_or_else(|| format!("{fallback}_{value}")),
+  )
+}
+
+fn decode_builtin_type_assembly(
+  data: &[u8],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let mut reader = BytecodeCursor::new(data);
+  let kind = reader.read_usize().ok()?;
+  let assembly = match kind {
+    0 => decode_builtin_integer_type(&mut reader)?,
+    1 => "index".to_owned(),
+    2 => decode_builtin_function_type(&mut reader, types, attributes, strings, depth)?,
+    3 => "bf16".to_owned(),
+    4 => "f16".to_owned(),
+    5 => "f32".to_owned(),
+    6 => "f64".to_owned(),
+    7 => "f80".to_owned(),
+    8 => "f128".to_owned(),
+    9 => {
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("complex<{element}>")
+    }
+    10 => decode_builtin_memref_type(&mut reader, types, attributes, strings, depth, false)?,
+    11 => decode_builtin_memref_type(&mut reader, types, attributes, strings, depth, true)?,
+    12 => "none".to_owned(),
+    13 => decode_builtin_ranked_tensor_type(&mut reader, types, attributes, strings, depth, false)?,
+    14 => decode_builtin_ranked_tensor_type(&mut reader, types, attributes, strings, depth, true)?,
+    15 => {
+      let types = read_bytecode_type_list(&mut reader, types, attributes, strings, depth)?;
+      format!("tuple<{}>", types.join(", "))
+    }
+    16 => {
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("memref<*x{element}>")
+    }
+    17 => {
+      let memory_space =
+        read_bytecode_attr_ref(&mut reader, attributes, types, strings, &[], depth)?;
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("memref<*x{element}, {memory_space}>")
+    }
+    18 => {
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("tensor<*x{element}>")
+    }
+    19 => decode_builtin_vector_type(&mut reader, types, attributes, strings, depth, false)?,
+    20 => decode_builtin_vector_type(&mut reader, types, attributes, strings, depth, true)?,
+    _ => return None,
+  };
+  reader.is_empty().then_some(assembly)
+}
+
+fn decode_vhlo_type_assembly(
+  data: &[u8],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let mut reader = BytecodeCursor::new(data);
+  let kind = reader.read_usize().ok()?;
+  let assembly = match kind {
+    0 => "i1".to_owned(),
+    1 => {
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("complex<{element}>")
+    }
+    2 => "bf16".to_owned(),
+    3 => "f16".to_owned(),
+    4 => "f32".to_owned(),
+    5 => "f64".to_owned(),
+    6 => "f8E4M3FN".to_owned(),
+    7 => "f8E5M2".to_owned(),
+    8 => decode_builtin_function_type(&mut reader, types, attributes, strings, depth)?,
+    9 => "index".to_owned(),
+    10 => "si4".to_owned(),
+    11 => "si8".to_owned(),
+    12 => "si16".to_owned(),
+    13 => "si32".to_owned(),
+    14 => "si64".to_owned(),
+    15 => "ui4".to_owned(),
+    16 => "ui8".to_owned(),
+    17 => "ui16".to_owned(),
+    18 => "ui32".to_owned(),
+    19 => "ui64".to_owned(),
+    20 | 41 => {
+      decode_builtin_ranked_tensor_type(&mut reader, types, attributes, strings, depth, false)?
+    }
+    21 => decode_builtin_ranked_tensor_type(&mut reader, types, attributes, strings, depth, true)?,
+    22 => "!vhlo.token".to_owned(),
+    23 => {
+      let types = read_bytecode_type_list(&mut reader, types, attributes, strings, depth)?;
+      format!("tuple<{}>", types.join(", "))
+    }
+    24 => decode_vhlo_uniform_quantized_type(&mut reader, types, attributes, strings, depth)?,
+    25 => {
+      let element = read_bytecode_type_ref(&mut reader, types, attributes, strings, depth)?;
+      format!("tensor<*x{element}>")
+    }
+    26 => "!vhlo.witness".to_owned(),
+    27 => "f8E4M3FNUZ".to_owned(),
+    28 => "f8E5M2FNUZ".to_owned(),
+    29 => "f8E4M3B11FNUZ".to_owned(),
+    30 => {
+      decode_vhlo_uniform_quantized_per_axis_type(&mut reader, types, attributes, strings, depth)?
+    }
+    31 => "si2".to_owned(),
+    32 => "ui2".to_owned(),
+    33 => "none".to_owned(),
+    34 => "tf32".to_owned(),
+    35 => "f8E4M3".to_owned(),
+    36 => "f8E3M4".to_owned(),
+    37 => "f4E2M1FN".to_owned(),
+    38 => "f6E2M3FN".to_owned(),
+    39 => "f6E3M2FN".to_owned(),
+    40 => "f8E8M0FNU".to_owned(),
+    42 => {
+      let types = read_bytecode_type_list(&mut reader, types, attributes, strings, depth)?;
+      format!("!stablehlo.future<{}>", types.join(", "))
+    }
+    _ => return None,
+  };
+  reader.is_empty().then_some(assembly)
+}
+
+fn decode_vhlo_uniform_quantized_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let _flags = reader.read_usize().ok()?;
+  let storage = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let expressed = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let scale = read_bytecode_f64(reader)?;
+  let zero_point = reader.read_signed().ok()?;
+  let storage_min = reader.read_signed().ok()?;
+  let storage_max = reader.read_signed().ok()?;
+  let zero_point = if zero_point == 0 {
+    String::new()
+  } else {
+    format!(":{zero_point}")
+  };
+  Some(format!(
+    "!quant.uniform<{storage}<{storage_min}:{storage_max}>:{expressed}, {scale}{zero_point}>"
+  ))
+}
+
+fn decode_vhlo_uniform_quantized_per_axis_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let _flags = reader.read_usize().ok()?;
+  let storage = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let expressed = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let dimension = reader.read_usize().ok()?;
+  let storage_min = reader.read_signed().ok()?;
+  let storage_max = reader.read_signed().ok()?;
+  let scale_count = reader.read_usize().ok()?;
+  let scales = (0..scale_count)
+    .map(|_| read_bytecode_f64(reader))
+    .collect::<Option<Vec<_>>>()?;
+  let zero_point_count = reader.read_usize().ok()?;
+  if zero_point_count != scale_count {
+    return None;
+  }
+  let zero_points = (0..zero_point_count)
+    .map(|_| reader.read_signed().ok())
+    .collect::<Option<Vec<_>>>()?;
+  let params = scales
+    .iter()
+    .zip(zero_points)
+    .map(|(scale, zero_point)| {
+      if zero_point == 0 {
+        scale.clone()
+      } else {
+        format!("{scale}:{zero_point}")
+      }
+    })
+    .collect::<Vec<_>>()
+    .join(", ");
+  Some(format!(
+    "!quant.uniform<{storage}<{storage_min}:{storage_max}>:{expressed}:{dimension}, {{{params}}}>"
+  ))
+}
+
+fn decode_builtin_integer_type(reader: &mut BytecodeCursor<'_>) -> Option<String> {
+  let width_and_signedness = reader.read_usize().ok()?;
+  let width = width_and_signedness >> 2;
+  match width_and_signedness & 0x3 {
+    0 => Some(format!("i{width}")),
+    1 => Some(format!("si{width}")),
+    2 => Some(format!("ui{width}")),
+    _ => None,
+  }
+}
+
+fn decode_builtin_function_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let inputs = read_bytecode_type_list(reader, types, attributes, strings, depth)?;
+  let results = read_bytecode_type_list(reader, types, attributes, strings, depth)?;
+  Some(format!(
+    "({}) -> ({})",
+    inputs.join(", "),
+    results.join(", ")
+  ))
+}
+
+fn decode_builtin_ranked_tensor_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+  has_encoding: bool,
+) -> Option<String> {
+  let encoding = if has_encoding {
+    Some(read_bytecode_attr_ref(
+      reader,
+      attributes,
+      types,
+      strings,
+      &[],
+      depth,
+    )?)
+  } else {
+    None
+  };
+  let shape = read_bytecode_shape(reader)?;
+  let element = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let body = shaped_type_body(&shape, &element);
+  Some(match encoding {
+    Some(encoding) => format!("tensor<{body}, {encoding}>"),
+    None => format!("tensor<{body}>"),
+  })
+}
+
+fn decode_builtin_memref_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+  has_memory_space: bool,
+) -> Option<String> {
+  let memory_space = if has_memory_space {
+    Some(read_bytecode_attr_ref(
+      reader,
+      attributes,
+      types,
+      strings,
+      &[],
+      depth,
+    )?)
+  } else {
+    None
+  };
+  let shape = read_bytecode_shape(reader)?;
+  let element = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let layout = read_bytecode_attr_ref(reader, attributes, types, strings, &[], depth)?;
+  let body = shaped_type_body(&shape, &element);
+  Some(match memory_space {
+    Some(memory_space) => format!("memref<{body}, {layout}, {memory_space}>"),
+    None => format!("memref<{body}, {layout}>"),
+  })
+}
+
+fn decode_builtin_vector_type(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+  has_scalable_dims: bool,
+) -> Option<String> {
+  let scalable_dims = if has_scalable_dims {
+    Some(read_bytecode_bool_list(reader)?)
+  } else {
+    None
+  };
+  let shape = read_bytecode_shape(reader)?;
+  let element = read_bytecode_type_ref(reader, types, attributes, strings, depth)?;
+  let shape = match scalable_dims {
+    Some(scalable_dims) if scalable_dims.len() == shape.len() => shape
+      .iter()
+      .zip(scalable_dims)
+      .map(|(dim, scalable)| {
+        if scalable {
+          format!("[{dim}]")
+        } else {
+          dim.clone()
+        }
+      })
+      .collect::<Vec<_>>(),
+    Some(_) => return None,
+    None => shape,
+  };
+  Some(format!("vector<{}>", shaped_type_body(&shape, &element)))
+}
+
+fn read_bytecode_type_ref(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<String> {
+  let type_index = reader.read_usize().ok()?;
+  decode_bytecode_type_assembly(type_index, types, attributes, strings, depth + 1)
+}
+
+fn read_bytecode_type_list(
+  reader: &mut BytecodeCursor<'_>,
+  types: &[BytecodeAttrTypeEntry<'_>],
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<Vec<String>> {
+  let count = reader.read_usize().ok()?;
+  (0..count)
+    .map(|_| read_bytecode_type_ref(reader, types, attributes, strings, depth))
+    .collect()
+}
+
+fn read_bytecode_shape(reader: &mut BytecodeCursor<'_>) -> Option<Vec<String>> {
+  let count = reader.read_usize().ok()?;
+  (0..count)
+    .map(|_| {
+      let dim = reader.read_signed().ok()?;
+      Some(if dim < 0 {
+        "?".to_owned()
+      } else {
+        dim.to_string()
+      })
+    })
+    .collect()
+}
+
+fn read_bytecode_signed_list(reader: &mut BytecodeCursor<'_>) -> Option<Vec<i64>> {
+  let count = reader.read_usize().ok()?;
+  (0..count).map(|_| reader.read_signed().ok()).collect()
+}
+
+fn read_bytecode_bool_list(reader: &mut BytecodeCursor<'_>) -> Option<Vec<bool>> {
+  let count = reader.read_usize().ok()?;
+  (0..count)
+    .map(|_| Some(reader.read_byte().ok()? != 0))
+    .collect()
+}
+
+fn read_bytecode_attr_list(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<Vec<String>> {
+  let count = reader.read_usize().ok()?;
+  (0..count)
+    .map(|_| read_bytecode_attr_ref(reader, attributes, types, strings, resource_handles, depth))
+    .collect()
+}
+
+fn read_bytecode_attr_ref(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  types: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  resource_handles: &[BytecodeResource],
+  depth: usize,
+) -> Option<String> {
+  let attribute_index = reader.read_usize().ok()?;
+  Some(
+    decode_bytecode_attr_assembly(
+      attribute_index,
+      attributes,
+      types,
+      strings,
+      resource_handles,
+      depth + 1,
+    )
+    .unwrap_or_else(|| format!("#bytecode.attr{attribute_index}")),
+  )
+}
+
+fn read_bytecode_string(reader: &mut BytecodeCursor<'_>, strings: &[String]) -> Option<String> {
+  strings.get(reader.read_usize().ok()?).cloned()
+}
+
+fn read_bytecode_string_attr_ref(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+) -> Option<String> {
+  decode_builtin_string_attr(reader.read_usize().ok()?, attributes, strings)
+}
+
+fn decode_bytecode_string_attr_value(
+  attribute: usize,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+) -> Option<String> {
+  if let Some(value) = decode_builtin_string_attr(attribute, attributes, strings) {
+    return Some(value);
+  }
+  let entry = attributes.get(attribute)?;
+  if entry.dialect != "vhlo" || !entry.has_custom_encoding {
+    return None;
+  }
+  let mut reader = BytecodeCursor::new(entry.data);
+  if reader.read_usize().ok()? != 14 {
+    return None;
+  }
+  let value = read_bytecode_string(&mut reader, strings)?;
+  reader.is_empty().then_some(value)
+}
+
+const BYTECODE_DENSE_NUMERIC_PREVIEW_VALUES: usize = 8;
+const BYTECODE_DENSE_STRING_PREVIEW_VALUES: usize = 8;
+
+fn read_bytecode_blob<'a>(reader: &mut BytecodeCursor<'a>) -> Option<&'a [u8]> {
+  let len = reader.read_usize().ok()?;
+  reader.read_bytes(len).ok()
+}
+
+fn quote_bytecode_string(value: &str) -> String {
+  let mut quoted = String::with_capacity(value.len() + 2);
+  quoted.push('"');
+  for ch in value.chars() {
+    match ch {
+      '"' => quoted.push_str("\\\""),
+      '\\' => quoted.push_str("\\\\"),
+      '\n' => quoted.push_str("\\n"),
+      '\r' => quoted.push_str("\\r"),
+      '\t' => quoted.push_str("\\t"),
+      ch if ch.is_control() => {
+        let _ = write!(&mut quoted, "\\u{{{:x}}}", ch as u32);
+      }
+      ch => quoted.push(ch),
+    }
+  }
+  quoted.push('"');
+  quoted
+}
+
+fn integer_type_width(ty: &str) -> Option<u32> {
+  if ty == "index" {
+    return Some(64);
+  }
+  let digits = ty
+    .strip_prefix("si")
+    .or_else(|| ty.strip_prefix("ui"))
+    .or_else(|| ty.strip_prefix('i'))?;
+  digits.parse().ok()
+}
+
+fn float_type_width(ty: &str) -> Option<u32> {
+  match ty {
+    "bf16" | "f16" => Some(16),
+    "f32" => Some(32),
+    "f64" => Some(64),
+    "f80" => Some(80),
+    "f128" => Some(128),
+    "tf32" => Some(19),
+    "f4E2M1FN" => Some(4),
+    "f6E2M3FN" | "f6E3M2FN" => Some(6),
+    "f8E3M4" | "f8E4M3" | "f8E4M3FN" | "f8E4M3FNUZ" | "f8E4M3B11FNUZ" | "f8E5M2" | "f8E5M2FNUZ"
+    | "f8E8M0FNU" => Some(8),
+    _ => None,
+  }
+}
+
+fn bytecode_dense_numeric_preview(ty: &str, blob: &[u8]) -> Option<String> {
+  let element = bytecode_shaped_element_type(ty)?;
+  let width = integer_type_width(element).or_else(|| float_type_width(element))?;
+  if width == 0 || width > 64 || width % 8 != 0 {
+    return None;
+  }
+  let byte_width = usize::try_from(width / 8).ok()?;
+  if !blob.len().is_multiple_of(byte_width) {
+    return None;
+  }
+  let stored_count = blob.len() / byte_width;
+  let preview_count = stored_count.min(BYTECODE_DENSE_NUMERIC_PREVIEW_VALUES);
+  let mut values = Vec::with_capacity(preview_count + usize::from(stored_count > preview_count));
+  for chunk in blob.chunks_exact(byte_width).take(preview_count) {
+    values.push(format_dense_numeric_value(element, width, chunk)?);
+  }
+  if stored_count > preview_count {
+    values.push(format!(
+      "... {} more",
+      stored_count - BYTECODE_DENSE_NUMERIC_PREVIEW_VALUES
+    ));
+  }
+  Some(format!("[{}]", values.join(", ")))
+}
+
+fn bytecode_shaped_element_type(ty: &str) -> Option<&str> {
+  let body = ty
+    .strip_prefix("tensor<")
+    .or_else(|| ty.strip_prefix("vector<"))?
+    .strip_suffix('>')?;
+  let mut rest = bytecode_split_top_level(body, ',').next()?.trim();
+  loop {
+    let Some(after_dim) = consume_shaped_dim_prefix(rest) else {
+      return (!rest.is_empty()).then_some(rest);
+    };
+    let after_separator = after_dim.trim_start().strip_prefix('x')?;
+    rest = after_separator.trim_start();
+    if consume_shaped_dim_prefix(rest).is_none() {
+      return (!rest.is_empty()).then_some(rest);
+    }
+  }
+}
+
+fn consume_shaped_dim_prefix(text: &str) -> Option<&str> {
+  let text = text.trim_start();
+  if let Some(rest) = text.strip_prefix('?') {
+    return Some(rest);
+  }
+  if let Some(rest) = text.strip_prefix('[') {
+    let end = rest.find(']')?;
+    let dim = &rest[..end];
+    if dim == "?" || dim.parse::<usize>().is_ok() {
+      return Some(&rest[end + 1..]);
+    }
+    return None;
+  }
+  let len = text
+    .bytes()
+    .take_while(|byte| byte.is_ascii_digit())
+    .count();
+  (len > 0).then_some(&text[len..])
+}
+
+fn bytecode_split_top_level(text: &str, delimiter: char) -> impl Iterator<Item = &str> {
+  let mut depth = 0usize;
+  let mut start = 0usize;
+  let mut parts = Vec::new();
+  for (index, ch) in text.char_indices() {
+    match ch {
+      '<' | '[' | '(' | '{' => depth += 1,
+      '>' | ']' | ')' | '}' => depth = depth.saturating_sub(1),
+      _ if ch == delimiter && depth == 0 => {
+        parts.push(&text[start..index]);
+        start = index + ch.len_utf8();
+      }
+      _ => {}
+    }
+  }
+  parts.push(&text[start..]);
+  parts.into_iter()
+}
+
+fn format_dense_numeric_value(element: &str, width: u32, bytes: &[u8]) -> Option<String> {
+  if integer_type_width(element).is_some() {
+    let value = read_little_endian_u64(bytes)?;
+    return Some(if element.starts_with("ui") {
+      value.to_string()
+    } else {
+      sign_extend_integer(value, width).to_string()
+    });
+  }
+  match element {
+    "bf16" | "f16" => Some(format_bytecode_float_bits(
+      u128::from(read_little_endian_u64(bytes)?),
+      width,
+    )),
+    "f32" => {
+      let bytes: [u8; 4] = bytes.try_into().ok()?;
+      Some(f32::from_le_bytes(bytes).to_string())
+    }
+    "f64" => {
+      let bytes: [u8; 8] = bytes.try_into().ok()?;
+      Some(f64::from_le_bytes(bytes).to_string())
+    }
+    _ => None,
+  }
+}
+
+fn read_little_endian_u64(bytes: &[u8]) -> Option<u64> {
+  if bytes.len() > 8 {
+    return None;
+  }
+  let mut value = 0u64;
+  for (index, byte) in bytes.iter().enumerate() {
+    value |= u64::from(*byte) << (index * 8);
+  }
+  Some(value)
+}
+
+fn sign_extend_integer(value: u64, width: u32) -> i128 {
+  let sign_bit = 1u128 << (width - 1);
+  let mask = (1u128 << width) - 1;
+  let value = u128::from(value) & mask;
+  if value & sign_bit == 0 {
+    value as i128
+  } else {
+    (value as i128) - (1i128 << width)
+  }
+}
+
+fn read_bytecode_apint_bits(reader: &mut BytecodeCursor<'_>, width: u32) -> Option<u128> {
+  if width <= 8 {
+    return Some(u128::from(reader.read_byte().ok()?));
+  }
+  if width <= 64 {
+    return Some(reader.read_signed().ok()? as u64 as u128);
+  }
+  let word_count = reader.read_usize().ok()?;
+  if word_count > 2 {
+    return None;
+  }
+  let mut bits = 0u128;
+  for word in 0..word_count {
+    bits |= u128::from(reader.read_signed().ok()? as u64) << (word * 64);
+  }
+  Some(bits)
+}
+
+fn read_bytecode_f64(reader: &mut BytecodeCursor<'_>) -> Option<String> {
+  Some(f64::from_bits(read_bytecode_apint_bits(reader, 64)? as u64).to_string())
+}
+
+fn format_bytecode_i64_list(values: &[i64]) -> String {
+  values
+    .iter()
+    .map(i64::to_string)
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+fn format_bytecode_float_bits(bits: u128, width: u32) -> String {
+  let digits = usize::try_from(width.div_ceil(4)).unwrap_or(32);
+  format!("0x{bits:0digits$x}")
+}
+
+fn shaped_type_body(shape: &[String], element: &str) -> String {
+  if shape.is_empty() {
+    element.to_owned()
+  } else {
+    format!("{}x{element}", shape.join("x"))
+  }
+}
+
+fn read_bytecode_attr_type_entries<'a>(
+  reader: &mut BytecodeCursor<'_>,
+  attr_type_section: &'a [u8],
+  dialects: &'a [BytecodeDialect],
+  target_count: usize,
+  offset: &mut usize,
+  kind: &str,
+) -> Result<Vec<BytecodeAttrTypeEntry<'a>>, ModelError> {
+  let mut entries = Vec::with_capacity(target_count);
+  while entries.len() < target_count {
+    let dialect = reader.read_usize()?;
+    let count = reader.read_usize()?;
+    if entries.len() + count > target_count {
+      return Err(invalid(format!(
+        "Invalid MLIR bytecode {kind} offset count."
+      )));
+    }
+    let dialect = dialects
+      .get(dialect)
+      .ok_or_else(|| invalid(format!("Invalid MLIR bytecode {kind} dialect index.")))?;
+    for _ in 0..count {
+      let (len, has_custom_encoding) = reader.read_varint_with_flag()?;
+      let end = (*offset)
+        .checked_add(len)
+        .ok_or_else(|| invalid(format!("MLIR bytecode {kind} offset overflow.")))?;
+      let data = attr_type_section
+        .get(*offset..end)
+        .ok_or_else(|| invalid(format!("Invalid MLIR bytecode {kind} offset.")))?;
+      entries.push(BytecodeAttrTypeEntry {
+        dialect: &dialect.name,
+        has_custom_encoding,
+        data,
+      });
+      *offset = end;
+    }
+  }
+  Ok(entries)
+}
+
+fn decode_builtin_location(
+  attribute: usize,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+) -> Option<BytecodeLocation> {
+  if depth > 16 {
+    return None;
+  }
+  let entry = attributes.get(attribute)?;
+  if entry.dialect != "builtin" || !entry.has_custom_encoding {
+    return None;
+  }
+  let mut reader = BytecodeCursor::new(entry.data);
+  match reader.read_usize().ok()? {
+    BUILTIN_CALL_SITE_LOC_KIND => {
+      let callee = reader.read_usize().ok()?;
+      let caller = reader.read_usize().ok()?;
+      let callee = decode_builtin_location(callee, attributes, strings, depth + 1);
+      let caller = decode_builtin_location(caller, attributes, strings, depth + 1);
+      callee
+        .clone()
+        .or_else(|| caller.clone())
+        .map(|mut location| {
+          location.assembly = match (callee.as_ref(), caller.as_ref()) {
+            (Some(callee), Some(caller)) => Some(format!(
+              "loc(callsite({} at {}))",
+              bytecode_location_body(callee),
+              bytecode_location_body(caller)
+            )),
+            _ => None,
+          };
+          location.attribute = attribute;
+          location.kind = "call_site";
+          location
+        })
+    }
+    BUILTIN_FILE_LINE_COL_LEGACY_OR_RANGE_KIND | BUILTIN_FILE_LINE_COL_RANGE_KIND => {
+      let filename = read_bytecode_location_filename(&mut reader, attributes, strings)?;
+      decode_builtin_file_line_col_location(attribute, filename, reader)
+    }
+    BUILTIN_FUSED_OR_FILE_LINE_COL_LOC_KIND => {
+      decode_builtin_fused_location(attribute, reader.clone(), attributes, strings, depth, false)
+        .or_else(|| {
+          let filename = read_bytecode_location_filename(&mut reader, attributes, strings)?;
+          decode_builtin_file_line_col_location(attribute, filename, reader)
+        })
+    }
+    BUILTIN_FUSED_LOC_WITH_METADATA_KIND => {
+      decode_builtin_fused_location(attribute, reader, attributes, strings, depth, true)
+    }
+    BUILTIN_NAME_LOC_KIND => {
+      let _name = reader.read_usize().ok()?;
+      let child = reader.read_usize().ok()?;
+      decode_builtin_location(child, attributes, strings, depth + 1).map(|mut location| {
+        location.attribute = attribute;
+        location.kind = "name";
+        location
+      })
+    }
+    BUILTIN_LEGACY_NAME_OR_UNKNOWN_LOC_KIND if reader.is_empty() => Some(BytecodeLocation {
+      attribute,
+      kind: "unknown",
+      file: None,
+      line: None,
+      column: None,
+      end_line: None,
+      end_column: None,
+      assembly: None,
+    }),
+    BUILTIN_LEGACY_NAME_OR_UNKNOWN_LOC_KIND => {
+      let _name = reader.read_usize().ok()?;
+      let child = reader.read_usize().ok()?;
+      decode_builtin_location(child, attributes, strings, depth + 1).map(|mut location| {
+        location.attribute = attribute;
+        location.kind = "name";
+        location
+      })
+    }
+    _ => None,
+  }
+}
+
+fn read_bytecode_location_filename(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+) -> Option<String> {
+  let index = reader.read_usize().ok()?;
+  decode_builtin_string_attr(index, attributes, strings).or_else(|| strings.get(index).cloned())
+}
+
+fn decode_builtin_fused_location(
+  attribute: usize,
+  mut reader: BytecodeCursor<'_>,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+  depth: usize,
+  has_metadata: bool,
+) -> Option<BytecodeLocation> {
+  if has_metadata {
+    let _metadata = reader.read_usize().ok()?;
+  }
+  let count = reader.read_usize().ok()?;
+  let mut location = None;
+  for _ in 0..count {
+    let child = reader.read_usize().ok()?;
+    if location.is_none() {
+      location = decode_builtin_location(child, attributes, strings, depth + 1);
+    }
+  }
+  if !reader.is_empty() {
+    return None;
+  }
+  location
+    .map(|mut location| {
+      location.attribute = attribute;
+      location.kind = "fused";
+      location
+    })
+    .or_else(|| {
+      (count == 0).then_some(BytecodeLocation {
+        attribute,
+        kind: "fused",
+        file: None,
+        line: None,
+        column: None,
+        end_line: None,
+        end_column: None,
+        assembly: None,
+      })
+    })
+}
+
+fn decode_builtin_string_attr(
+  attribute: usize,
+  attributes: &[BytecodeAttrTypeEntry<'_>],
+  strings: &[String],
+) -> Option<String> {
+  let entry = attributes.get(attribute)?;
+  decode_builtin_string_attr_entry(entry, strings)
+}
+
+fn decode_builtin_string_attr_entry(
+  entry: &BytecodeAttrTypeEntry<'_>,
+  strings: &[String],
+) -> Option<String> {
+  if entry.dialect != "builtin" || !entry.has_custom_encoding {
+    return None;
+  }
+  let mut reader = BytecodeCursor::new(entry.data);
+  if reader.read_usize().ok()? != BUILTIN_STRING_ATTR_KIND {
+    return None;
+  }
+  strings.get(reader.read_usize().ok()?).cloned()
+}
+
+fn read_bytecode_usize_list(reader: &mut BytecodeCursor<'_>) -> Result<Vec<usize>, ModelError> {
+  let count = reader.read_usize()?;
+  (0..count).map(|_| reader.read_usize()).collect()
+}
+
+fn decode_builtin_file_line_col_location(
+  attribute: usize,
+  filename: String,
+  mut reader: BytecodeCursor<'_>,
+) -> Option<BytecodeLocation> {
+  let mut strict_reader = reader.clone();
+  if let (Ok(line), Ok(column)) = (strict_reader.read_usize(), strict_reader.read_usize())
+    && strict_reader.is_empty()
+  {
+    return Some(BytecodeLocation {
+      attribute,
+      kind: "file_line_col",
+      file: Some(filename),
+      line: Some(line),
+      column: Some(column),
+      end_line: None,
+      end_column: None,
+      assembly: None,
+    });
+  }
+
+  let line_cols = read_bytecode_usize_list(&mut reader).ok()?;
+  if !reader.is_empty() {
+    return None;
+  }
+  bytecode_location_from_line_cols(attribute, "file_line_col_range", Some(filename), &line_cols)
+}
+
+fn bytecode_location_from_line_cols(
+  attribute: usize,
+  kind: &'static str,
+  file: Option<String>,
+  line_cols: &[usize],
+) -> Option<BytecodeLocation> {
+  match line_cols {
+    [] => Some(BytecodeLocation {
+      attribute,
+      kind,
+      file,
+      line: None,
+      column: None,
+      end_line: None,
+      end_column: None,
+      assembly: None,
+    }),
+    [line] => Some(BytecodeLocation {
+      attribute,
+      kind,
+      file,
+      line: Some(*line),
+      column: None,
+      end_line: None,
+      end_column: None,
+      assembly: None,
+    }),
+    [line, column] => Some(BytecodeLocation {
+      attribute,
+      kind,
+      file,
+      line: Some(*line),
+      column: Some(*column),
+      end_line: None,
+      end_column: None,
+      assembly: None,
+    }),
+    [line, column, end_column] => Some(BytecodeLocation {
+      attribute,
+      kind,
+      file,
+      line: Some(*line),
+      column: Some(*column),
+      end_line: Some(*line),
+      end_column: Some(*end_column),
+      assembly: None,
+    }),
+    [line, column, end_line, end_column] => Some(BytecodeLocation {
+      attribute,
+      kind,
+      file,
+      line: Some(*line),
+      column: Some(*column),
+      end_line: Some(*end_line),
+      end_column: Some(*end_column),
+      assembly: None,
+    }),
+    _ => None,
+  }
+}
+
+fn bytecode_location_assembly(location: &BytecodeLocation) -> String {
+  if let Some(assembly) = &location.assembly {
+    return assembly.clone();
+  }
+  format!("loc({})", bytecode_location_body(location))
+}
+
+fn bytecode_location_body(location: &BytecodeLocation) -> String {
+  let mut body = String::new();
+  if let Some(file) = &location.file {
+    body.push_str(&quote_bytecode_string(file));
+  }
+  if let Some(line) = location.line {
+    if !body.is_empty() {
+      body.push(':');
+    }
+    let _ = write!(&mut body, "{line}");
+    if let Some(column) = location.column {
+      let _ = write!(&mut body, ":{column}");
+    }
+  }
+  if let Some(end_line) = location.end_line {
+    body.push_str(" to ");
+    let _ = write!(&mut body, "{end_line}");
+    if let Some(end_column) = location.end_column {
+      let _ = write!(&mut body, ":{end_column}");
+    }
+  } else if let Some(end_column) = location.end_column {
+    let _ = write!(&mut body, " to {end_column}");
+  }
+  if body.is_empty() {
+    "unknown".to_owned()
+  } else {
+    body
+  }
+}
+
 fn parse_resources(
   resource_section: Option<&[u8]>,
   offset_section: Option<&[u8]>,
   strings: &[String],
   dialects: &[BytecodeDialect],
-) -> Result<Vec<BytecodeResource>, ModelError> {
+) -> Result<BytecodeResources, ModelError> {
   let Some(offset_section) = offset_section else {
-    return Ok(Vec::new());
+    return Ok(BytecodeResources::default());
   };
   let mut resource_reader = BytecodeCursor::new(resource_section.unwrap_or_default());
   let mut reader = BytecodeCursor::new(offset_section);
   let mut resources = Vec::new();
+  let mut handles = Vec::new();
   let external_groups = reader.read_usize()?;
   for _ in 0..external_groups {
     let scope = read_string_index(strings, reader.read_usize()?)?.to_owned();
@@ -540,8 +2876,10 @@ fn parse_resources(
       &mut reader,
       &mut resource_reader,
       &mut resources,
+      &mut handles,
       &scope,
       strings,
+      false,
     )?;
   }
   while !reader.is_empty() {
@@ -555,19 +2893,23 @@ fn parse_resources(
       &mut reader,
       &mut resource_reader,
       &mut resources,
+      &mut handles,
       &scope,
       strings,
+      true,
     )?;
   }
-  Ok(resources)
+  Ok(BytecodeResources { resources, handles })
 }
 
 fn read_resource_group(
   reader: &mut BytecodeCursor<'_>,
   resource_reader: &mut BytecodeCursor<'_>,
   resources: &mut Vec<BytecodeResource>,
+  handles: &mut Vec<BytecodeResource>,
   scope: &str,
   strings: &[String],
+  collect_handles: bool,
 ) -> Result<(), ModelError> {
   let count = reader.read_usize()?;
   for _ in 0..count {
@@ -575,11 +2917,15 @@ fn read_resource_group(
     let size = reader.read_usize()?;
     let kind = bytecode_resource_kind(reader.read_byte()?);
     let _data = resource_reader.read_bytes(size)?;
-    resources.push(BytecodeResource {
+    let resource = BytecodeResource {
       scope: scope.to_owned(),
       name,
       kind: kind.to_owned(),
-    });
+    };
+    if collect_handles {
+      handles.push(resource.clone());
+    }
+    resources.push(resource);
   }
   Ok(())
 }
@@ -600,15 +2946,420 @@ fn bytecode_resource_kind(kind: u8) -> &'static str {
   }
 }
 
-fn parse_property_count(section: Option<&[u8]>) -> Result<usize, ModelError> {
+const BYTECODE_ATTR_TYPE_PREVIEW_BYTES: usize = 16;
+const BYTECODE_PROPERTY_PREVIEW_BYTES: usize = 16;
+
+fn parse_bytecode_properties(section: Option<&[u8]>) -> Result<Vec<BytecodeProperty>, ModelError> {
   let Some(section) = section else {
-    return Ok(0);
+    return Ok(Vec::new());
   };
+  if section.is_empty() {
+    return Ok(Vec::new());
+  }
   let mut reader = BytecodeCursor::new(section);
-  reader.read_usize()
+  let count = reader.read_usize()?;
+  let mut properties = Vec::with_capacity(count);
+  for index in 0..count {
+    let len = reader.read_usize()?;
+    let data = reader.read_bytes(len)?;
+    properties.push(BytecodeProperty {
+      index,
+      len,
+      data: data.to_vec(),
+      preview_hex: hex_preview(data, BYTECODE_PROPERTY_PREVIEW_BYTES),
+    });
+  }
+  if !reader.is_empty() {
+    return Err(invalid("Invalid MLIR bytecode properties section."));
+  }
+  Ok(properties)
+}
+
+fn decode_bytecode_func_symbol(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  read_bytecode_func_property_fields(operation, properties, attributes)?.sym_name
+}
+
+fn decode_bytecode_func_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  let Some(fields) = read_bytecode_func_property_fields(operation, properties, attributes) else {
+    return Vec::new();
+  };
+  let mut values = Vec::new();
+  push_decoded_property(&mut values, "arg_attrs", fields.arg_attrs);
+  push_decoded_property(&mut values, "function_type", fields.function_type);
+  push_decoded_property(&mut values, "res_attrs", fields.res_attrs);
+  push_decoded_property(&mut values, "sym_name", fields.sym_name);
+  push_decoded_property(&mut values, "sym_visibility", fields.sym_visibility);
+  values
+}
+
+fn decode_bytecode_module_symbol(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  if operation.name != "builtin.module" {
+    return None;
+  }
+  read_bytecode_module_property_fields(operation, properties, attributes)?.sym_name
+}
+
+fn decode_bytecode_module_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  let Some(fields) = read_bytecode_module_property_fields(operation, properties, attributes) else {
+    return Vec::new();
+  };
+  let mut values = Vec::new();
+  push_decoded_property(&mut values, "sym_name", fields.sym_name);
+  push_decoded_property(&mut values, "sym_visibility", fields.sym_visibility);
+  values
+}
+
+fn decode_bytecode_torch_operator_name(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  if operation.name != "torch.operator" {
+    return None;
+  }
+  // Netron metadata defines torch.operator with one property, name: StrAttr.
+  decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+}
+
+fn decode_bytecode_func_constant_symbol(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  if operation.name != "func.constant" {
+    return None;
+  }
+  decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+}
+
+fn decode_bytecode_util_global_symbol(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  if operation.name != "util.global" {
+    return None;
+  }
+  let fields = read_bytecode_util_global_property_fields(operation, properties, attributes)?;
+  fields.sym_name
+}
+
+fn decode_bytecode_util_global_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  let Some(fields) = read_bytecode_util_global_property_fields(operation, properties, attributes)
+  else {
+    return Vec::new();
+  };
+  let mut values = Vec::new();
+  push_decoded_property(&mut values, "initial_value", fields.initial_value);
+  push_decoded_property(&mut values, "inlining_policy", fields.inlining_policy);
+  push_decoded_property(&mut values, "is_mutable", fields.is_mutable);
+  push_decoded_property(&mut values, "sym_name", fields.sym_name);
+  push_decoded_property(&mut values, "sym_visibility", fields.sym_visibility);
+  push_decoded_property(&mut values, "type", fields.type_value);
+  values
+}
+
+fn decode_bytecode_util_global_ref_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  let Some(fields) =
+    read_bytecode_util_global_ref_property_fields(operation, properties, attributes)
+  else {
+    return Vec::new();
+  };
+  let mut values = Vec::new();
+  push_decoded_property(&mut values, "global", fields.global);
+  push_decoded_property(&mut values, "is_immutable", fields.is_immutable);
+  values
+}
+
+#[derive(Default)]
+struct BytecodeUtilGlobalFields {
+  initial_value: Option<String>,
+  inlining_policy: Option<String>,
+  is_mutable: Option<String>,
+  sym_name: Option<String>,
+  sym_visibility: Option<String>,
+  type_value: Option<String>,
+}
+
+#[derive(Default)]
+struct BytecodeUtilGlobalRefFields {
+  global: Option<String>,
+  is_immutable: Option<String>,
+}
+
+struct BytecodeFuncFields {
+  arg_attrs: Option<String>,
+  function_type: Option<String>,
+  res_attrs: Option<String>,
+  sym_name: Option<String>,
+  sym_visibility: Option<String>,
+}
+
+struct BytecodeModuleFields {
+  sym_name: Option<String>,
+  sym_visibility: Option<String>,
+}
+
+struct BytecodeFuncCallFields {
+  arg_attrs: Option<String>,
+  callee: Option<String>,
+  no_inline: Option<String>,
+  res_attrs: Option<String>,
+}
+
+fn read_bytecode_func_property_fields(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<BytecodeFuncFields> {
+  if operation.name != "func.func" {
+    return None;
+  }
+  let property = properties.get(operation.properties?)?;
+  let mut reader = BytecodeCursor::new(&property.data);
+  // LLVM 19 generated FuncOp bytecode properties are sorted inherent attrs:
+  // arg_attrs?, function_type, res_attrs?, sym_name, sym_visibility?.
+  let fields = BytecodeFuncFields {
+    arg_attrs: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    function_type: Some(read_required_bytecode_property_value(
+      &mut reader,
+      attributes,
+    )?),
+    res_attrs: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    sym_name: Some(read_required_bytecode_property_value(
+      &mut reader,
+      attributes,
+    )?),
+    sym_visibility: read_optional_bytecode_property_value(&mut reader, attributes)?,
+  };
+  reader.is_empty().then_some(fields)
+}
+
+fn read_bytecode_module_property_fields(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<BytecodeModuleFields> {
+  if operation.name != "builtin.module" {
+    return None;
+  }
+  let property = properties.get(operation.properties?)?;
+  let mut reader = BytecodeCursor::new(&property.data);
+  // Netron's bytecode property reader sorts builtin.module properties by name:
+  // sym_name?, sym_visibility?. Both are OptionalAttr payloads.
+  let fields = BytecodeModuleFields {
+    sym_name: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    sym_visibility: read_optional_bytecode_property_value(&mut reader, attributes)?,
+  };
+  reader.is_empty().then_some(fields)
+}
+
+fn decode_bytecode_func_call_properties(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Vec<(&'static str, String)> {
+  if let Some(fields) = read_bytecode_func_call_property_fields(operation, properties, attributes) {
+    let mut values = Vec::new();
+    push_decoded_property(&mut values, "arg_attrs", fields.arg_attrs);
+    push_decoded_property(&mut values, "callee", fields.callee);
+    push_decoded_property(&mut values, "no_inline", fields.no_inline);
+    push_decoded_property(&mut values, "res_attrs", fields.res_attrs);
+    return values;
+  }
+  decode_bytecode_single_attribute_property_value(operation, properties, attributes)
+    .map(|callee| vec![("callee", callee)])
+    .unwrap_or_default()
+}
+
+fn read_bytecode_func_call_property_fields(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<BytecodeFuncCallFields> {
+  if operation.name != "func.call" {
+    return None;
+  }
+  let property = properties.get(operation.properties?)?;
+  let mut reader = BytecodeCursor::new(&property.data);
+  // LLVM 19 generated CallOp bytecode properties are sorted inherent attrs:
+  // arg_attrs?, callee, no_inline?, res_attrs?.
+  let fields = BytecodeFuncCallFields {
+    arg_attrs: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    callee: Some(read_required_bytecode_property_value(
+      &mut reader,
+      attributes,
+    )?),
+    no_inline: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    res_attrs: read_optional_bytecode_property_value(&mut reader, attributes)?,
+  };
+  reader.is_empty().then_some(fields)
+}
+
+fn read_bytecode_util_global_property_fields(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<BytecodeUtilGlobalFields> {
+  let property = properties.get(operation.properties?)?;
+  let mut reader = BytecodeCursor::new(&property.data);
+  // Netron metadata/generated readProperties order for util.global:
+  // initial_value?, inlining_policy?, is_mutable?, sym_name, sym_visibility?, type.
+  let fields = BytecodeUtilGlobalFields {
+    initial_value: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    inlining_policy: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    is_mutable: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    sym_name: Some(read_required_bytecode_property_value(
+      &mut reader,
+      attributes,
+    )?),
+    sym_visibility: read_optional_bytecode_property_value(&mut reader, attributes)?,
+    type_value: Some(read_required_bytecode_property_value(
+      &mut reader,
+      attributes,
+    )?),
+  };
+  reader.is_empty().then_some(fields)
+}
+
+fn read_bytecode_util_global_ref_property_fields(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<BytecodeUtilGlobalRefFields> {
+  let property = properties.get(operation.properties?)?;
+  let mut reader = BytecodeCursor::new(&property.data);
+  let fields = match operation.name.as_str() {
+    "util.global.load" => {
+      // Netron metadata/generated readProperties order: global, is_immutable?.
+      BytecodeUtilGlobalRefFields {
+        global: Some(read_required_bytecode_property_value(
+          &mut reader,
+          attributes,
+        )?),
+        is_immutable: read_optional_bytecode_property_value(&mut reader, attributes)?,
+      }
+    }
+    "util.global.store" => BytecodeUtilGlobalRefFields {
+      global: Some(read_required_bytecode_property_value(
+        &mut reader,
+        attributes,
+      )?),
+      is_immutable: None,
+    },
+    _ => return None,
+  };
+  reader.is_empty().then_some(fields)
+}
+
+fn read_required_bytecode_property_value(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  let attribute_index = reader.read_usize().ok()?;
+  bytecode_attribute_metadata_value(attributes, attribute_index)
+}
+
+fn read_optional_bytecode_property_value(
+  reader: &mut BytecodeCursor<'_>,
+  attributes: &[BytecodeAttribute],
+) -> Option<Option<String>> {
+  let (attribute_index, present) = reader.read_varint_with_flag().ok()?;
+  if present {
+    bytecode_attribute_metadata_value(attributes, attribute_index).map(Some)
+  } else {
+    Some(None)
+  }
+}
+
+fn push_decoded_property(
+  values: &mut Vec<(&'static str, String)>,
+  name: &'static str,
+  value: Option<String>,
+) {
+  if let Some(value) = value {
+    values.push((name, value));
+  }
+}
+
+fn decode_bytecode_single_attribute_property_value(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+  attributes: &[BytecodeAttribute],
+) -> Option<String> {
+  let attribute_index = read_bytecode_single_property_slot(operation, properties)?;
+  bytecode_attribute_metadata_value(attributes, attribute_index)
+}
+
+fn read_bytecode_single_property_slot(
+  operation: &BytecodeIrOperation,
+  properties: &[BytecodeProperty],
+) -> Option<usize> {
+  let property = properties.get(operation.properties?)?;
+  let slots = read_bytecode_property_slots(&property.data)?;
+  if slots.len() != 1 {
+    return None;
+  }
+  Some(slots[0])
+}
+
+fn read_bytecode_property_slots(data: &[u8]) -> Option<Vec<usize>> {
+  let mut reader = BytecodeCursor::new(data);
+  let mut slots = Vec::new();
+  while !reader.is_empty() {
+    slots.push(reader.read_usize().ok()?);
+  }
+  Some(slots)
+}
+
+fn bytecode_attribute_metadata_value(
+  attributes: &[BytecodeAttribute],
+  attribute_index: usize,
+) -> Option<String> {
+  let attribute = attributes.get(attribute_index)?;
+  if attribute.index != attribute_index {
+    return None;
+  }
+  attribute
+    .string
+    .clone()
+    .or_else(|| attribute.assembly.clone())
+}
+
+fn hex_preview(data: &[u8], limit: usize) -> String {
+  let mut preview = String::with_capacity(data.len().min(limit) * 2);
+  for byte in data.iter().take(limit) {
+    let _ = write!(&mut preview, "{byte:02x}");
+  }
+  preview
 }
 
 const BYTECODE_IR_NODE_LIMIT: usize = 20_000;
+const BYTECODE_IR_VALUE_LIMIT: usize = 256;
 const BYTECODE_FUNCTION_SUMMARY_LIMIT: usize = 1_024;
 
 fn parse_ir_summary(
@@ -631,11 +3382,11 @@ fn parse_ir_summary(
     .map_err(|error| error.to_string())?;
   if header.has_args {
     scanner
-      .read_block_arguments(&mut reader)
+      .read_block_arguments(&mut reader, 0, 0)
       .map_err(|error| error.to_string())?;
   }
   scanner
-    .read_operations(&mut reader, header.num_ops)
+    .read_operations(&mut reader, header.num_ops, 0, 0)
     .map_err(|error| error.to_string())?;
   Ok(scanner.summary)
 }
@@ -652,23 +3403,26 @@ struct BlockHeader {
 }
 
 impl IrScanner<'_> {
-  fn read_region(&mut self, reader: &mut BytecodeCursor<'_>) -> Result<(), ModelError> {
+  fn read_region(&mut self, reader: &mut BytecodeCursor<'_>) -> Result<Option<usize>, ModelError> {
     let block_count = reader.read_usize()?;
     if block_count == 0 {
-      return Ok(());
+      return Ok(None);
     }
     let value_count = reader.read_usize()?;
+    let region = self.summary.region_count;
+    let first_block = self.summary.block_count;
     self.summary.region_count += 1;
     self.summary.block_count += block_count;
     self.summary.value_count += value_count;
-    for _ in 0..block_count {
+    for block_offset in 0..block_count {
+      let block = first_block + block_offset;
       let header = self.read_block_header(reader)?;
       if header.has_args {
-        self.read_block_arguments(reader)?;
+        self.read_block_arguments(reader, region, block)?;
       }
-      self.read_operations(reader, header.num_ops)?;
+      self.read_operations(reader, header.num_ops, region, block)?;
     }
-    Ok(())
+    Ok(Some(region))
   }
 
   fn read_block_header(
@@ -683,20 +3437,37 @@ impl IrScanner<'_> {
     })
   }
 
-  fn read_block_arguments(&mut self, reader: &mut BytecodeCursor<'_>) -> Result<(), ModelError> {
+  fn read_block_arguments(
+    &mut self,
+    reader: &mut BytecodeCursor<'_>,
+    region: usize,
+    block: usize,
+  ) -> Result<(), ModelError> {
     let count = reader.read_usize()?;
     self.summary.block_argument_count += count;
+    let first_argument = self.summary.value_count;
     self.summary.value_count += count;
-    for _ in 0..count {
-      if self.version >= 4 {
-        let (_type_index, has_location) = reader.read_varint_with_flag()?;
-        if has_location {
-          let _location = reader.read_usize()?;
-        }
+    for offset in 0..count {
+      let (type_index, location) = if self.version >= 4 {
+        let (type_index, has_location) = reader.read_varint_with_flag()?;
+        let location = if has_location {
+          Some(reader.read_usize()?)
+        } else {
+          None
+        };
+        (type_index, location)
       } else {
-        let _type_index = reader.read_usize()?;
-        let _location = reader.read_usize()?;
-      }
+        (reader.read_usize()?, Some(reader.read_usize()?))
+      };
+      self.push_value(BytecodeIrValue {
+        value: first_argument + offset,
+        kind: "block_argument",
+        region,
+        block,
+        operation: None,
+        type_index: Some(type_index),
+        location,
+      });
     }
     if self.version >= 3 && reader.read_byte()? != 0 {
       self.skip_use_list_orders(reader, count)?;
@@ -708,21 +3479,28 @@ impl IrScanner<'_> {
     &mut self,
     reader: &mut BytecodeCursor<'_>,
     count: usize,
+    region: usize,
+    block: usize,
   ) -> Result<(), ModelError> {
     for _ in 0..count {
-      let (region_count, isolated) = self.read_operation(reader)?;
+      let (operation, region_count, isolated) = self.read_operation(reader, region, block)?;
+      let mut nested_region_ids = Vec::new();
       for _ in 0..region_count {
-        if self.version >= 2 && isolated {
+        let nested_region = if self.version >= 2 && isolated {
           let (section, data) = reader.read_section()?;
           if section.id != 4 {
             return Err(invalid("Expected MLIR bytecode IR section for region."));
           }
           let mut nested = BytecodeCursor::new(data);
-          self.read_region(&mut nested)?;
+          self.read_region(&mut nested)?
         } else {
-          self.read_region(reader)?;
+          self.read_region(reader)?
+        };
+        if let Some(region) = nested_region {
+          nested_region_ids.push(region);
         }
       }
+      self.set_nested_region_ids(operation, nested_region_ids);
     }
     Ok(())
   }
@@ -730,14 +3508,17 @@ impl IrScanner<'_> {
   fn read_operation(
     &mut self,
     reader: &mut BytecodeCursor<'_>,
-  ) -> Result<(usize, bool), ModelError> {
+    region: usize,
+    block: usize,
+  ) -> Result<(usize, usize, bool), ModelError> {
     let op_index = reader.read_usize()?;
     let operation = self
       .op_names
       .get(op_index)
       .ok_or_else(|| invalid("Invalid MLIR bytecode operation name index."))?;
     let op_mask = reader.read_byte()?;
-    let _location = reader.read_usize()?;
+    let location = reader.read_usize()?;
+    let operation_index = self.summary.operation_count;
     if self.summary.operation_names.len() < BYTECODE_IR_NODE_LIMIT {
       self.summary.operation_names.push(operation.full_name());
     } else {
@@ -752,26 +3533,98 @@ impl IrScanner<'_> {
       self.summary.function_count += 1;
     }
 
-    if op_mask & 0x01 != 0 {
-      let _attributes = reader.read_usize()?;
-    }
-    if op_mask & 0x40 != 0 {
-      let _properties = reader.read_usize()?;
-    }
+    let attributes = if op_mask & 0x01 != 0 {
+      Some(reader.read_usize()?)
+    } else {
+      None
+    };
+    let properties = if op_mask & 0x40 != 0 {
+      Some(reader.read_usize()?)
+    } else {
+      None
+    };
     let mut result_count = 0usize;
     if op_mask & 0x02 != 0 {
       result_count = reader.read_usize()?;
+      let first_result = self.summary.value_count;
       self.summary.value_count += result_count;
-      for _ in 0..result_count {
-        let _type_index = reader.read_usize()?;
+      let result_types = (0..result_count)
+        .map(|_| reader.read_usize())
+        .collect::<Result<Vec<_>, _>>()?;
+      let results = (first_result..first_result + result_count).collect::<Vec<_>>();
+      for (offset, type_index) in result_types.iter().copied().enumerate() {
+        self.push_value(BytecodeIrValue {
+          value: first_result + offset,
+          kind: "operation_result",
+          region,
+          block,
+          operation: Some(operation_index),
+          type_index: Some(type_index),
+          location: Some(location),
+        });
       }
+      let operands = if op_mask & 0x04 != 0 {
+        let operand_count = reader.read_usize()?;
+        (0..operand_count)
+          .map(|_| reader.read_usize())
+          .collect::<Result<Vec<_>, _>>()?
+      } else {
+        Vec::new()
+      };
+      return self.finish_operation(
+        reader,
+        op_mask,
+        result_count,
+        BytecodeIrOperation {
+          name,
+          operation: operation_index,
+          region,
+          block,
+          location: Some(location),
+          attributes,
+          properties,
+          operands,
+          results,
+          nested_regions: 0,
+          nested_region_ids: Vec::new(),
+        },
+      );
     }
-    if op_mask & 0x04 != 0 {
+    let operands = if op_mask & 0x04 != 0 {
       let operand_count = reader.read_usize()?;
-      for _ in 0..operand_count {
-        let _value_index = reader.read_usize()?;
-      }
-    }
+      (0..operand_count)
+        .map(|_| reader.read_usize())
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+      Vec::new()
+    };
+    self.finish_operation(
+      reader,
+      op_mask,
+      result_count,
+      BytecodeIrOperation {
+        name,
+        operation: operation_index,
+        region,
+        block,
+        location: Some(location),
+        attributes,
+        properties,
+        operands,
+        results: Vec::new(),
+        nested_regions: 0,
+        nested_region_ids: Vec::new(),
+      },
+    )
+  }
+
+  fn finish_operation(
+    &mut self,
+    reader: &mut BytecodeCursor<'_>,
+    op_mask: u8,
+    result_count: usize,
+    mut operation: BytecodeIrOperation,
+  ) -> Result<(usize, usize, bool), ModelError> {
     if op_mask & 0x08 != 0 {
       let successor_count = reader.read_usize()?;
       for _ in 0..successor_count {
@@ -785,9 +3638,44 @@ impl IrScanner<'_> {
       let raw = reader.read_varint()?;
       let region_count = usize::try_from(raw >> 1)
         .map_err(|_| invalid("MLIR bytecode operation has too many regions."))?;
-      return Ok((region_count, raw & 1 == 1));
+      let operation_index = operation.operation;
+      operation.nested_regions = region_count;
+      self.push_operation(operation);
+      return Ok((operation_index, region_count, raw & 1 == 1));
     }
-    Ok((0, false))
+    let operation_index = operation.operation;
+    self.push_operation(operation);
+    Ok((operation_index, 0, false))
+  }
+
+  fn push_operation(&mut self, operation: BytecodeIrOperation) {
+    if self.summary.operations.len() < BYTECODE_IR_NODE_LIMIT {
+      self.summary.operations.push(operation);
+    } else {
+      self.summary.truncated = true;
+    }
+  }
+
+  fn push_value(&mut self, value: BytecodeIrValue) {
+    if self.summary.values.len() < BYTECODE_IR_VALUE_LIMIT {
+      self.summary.values.push(value);
+    } else {
+      self.summary.truncated = true;
+    }
+  }
+
+  fn set_nested_region_ids(&mut self, operation: usize, nested_region_ids: Vec<usize>) {
+    if nested_region_ids.is_empty() {
+      return;
+    }
+    if let Some(summary) = self
+      .summary
+      .operations
+      .iter_mut()
+      .find(|summary| summary.operation == operation)
+    {
+      summary.nested_region_ids = nested_region_ids;
+    }
   }
 
   fn skip_use_list_orders(
@@ -884,6 +3772,12 @@ impl<'a> BytecodeCursor<'a> {
       .map_err(|_| invalid("MLIR bytecode integer does not fit in usize."))
   }
 
+  fn read_signed(&mut self) -> Result<i64, ModelError> {
+    let raw = self.read_varint()?;
+    let value = (raw >> 1) ^ (!((raw & 1).wrapping_sub(1)));
+    Ok(value as i64)
+  }
+
   fn read_varint_with_flag(&mut self) -> Result<(usize, bool), ModelError> {
     let raw = self.read_varint()?;
     Ok((
@@ -942,12 +3836,8 @@ impl<'a> BytecodeCursor<'a> {
 
 fn is_mlir_line(line: &str) -> bool {
   let line = line.trim_start();
-  line.starts_with("module ")
-    || line.starts_with("\"builtin.module\"")
-    || line.starts_with("builtin.module ")
-    || line.starts_with("vm.module ")
-    || line.starts_with("spv.module ")
-    || line.starts_with("spirv.module ")
+  is_module_start(line)
+    || is_spirv_module_start(line)
     || line.starts_with("func ")
     || line.starts_with("func.func ")
     || line.starts_with('#') && line.contains('=')
@@ -992,7 +3882,7 @@ fn is_function_start_token(token: &str) -> bool {
       .is_some_and(|(_, version)| version.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
+fn lower_model(parsed: ParsedModel) -> Model {
   let mut model = Model::new(FormatInfo {
     name: FORMAT,
     version: None,
@@ -1105,7 +3995,7 @@ fn lower_model(parsed: ParsedModel) -> Result<Model, ModelError> {
     model.add_function(lowered);
   }
 
-  Ok(model)
+  model
 }
 
 fn post_order_modules(mut modules: Vec<ParsedModule>) -> Vec<ParsedModule> {
@@ -1185,6 +4075,7 @@ impl FunctionValues {
     function.values.push(FunctionValue {
       name: model.intern(name),
       type_info: None,
+      metadata: BTreeMap::new(),
       initializer: None,
     });
     self.indices.insert(name.to_owned(), index);
@@ -1883,19 +4774,15 @@ fn suppress_executable_function(
   parsed.modules.get(module_index).is_some_and(|module| {
     module.nodes.iter().any(|node| {
       matches!(node.operator.as_str(), "flow.executable" | "hal.executable")
-        && node_symbol_name(node).is_some_and(|name| name == function_name)
+        && node.attributes.iter().any(|attribute| {
+          attribute.name == "sym_name"
+            && matches!(
+              &attribute.value,
+              ParsedAttributeValue::String(value) | ParsedAttributeValue::Reference(value)
+                if value == &function_name
+            )
+        })
     })
-  })
-}
-
-fn node_symbol_name(node: &ParsedNode) -> Option<&str> {
-  node.attributes.iter().find_map(|attribute| {
-    (attribute.name == "sym_name").then_some(match &attribute.value {
-      ParsedAttributeValue::String(value) | ParsedAttributeValue::Reference(value) => {
-        Some(value.as_str())
-      }
-      _ => None,
-    })?
   })
 }
 
@@ -2001,11 +4888,11 @@ fn parse_spirv_module_metadata(rest: &str) -> BTreeMap<String, String> {
 }
 
 fn is_function_start(line: &str) -> bool {
-  normalized_operator_token(line).is_some_and(is_function_start_token)
-}
-
-fn normalized_operator_token(line: &str) -> Option<&str> {
-  normalized_operator_token_from_token(line.split_whitespace().next()?)
+  line
+    .split_whitespace()
+    .next()
+    .and_then(normalized_operator_token_from_token)
+    .is_some_and(is_function_start_token)
 }
 
 fn parse_function(capture: FunctionCapture) -> ParsedFunction {
@@ -3362,8 +6249,7 @@ fn leading_quoted_string(text: &str) -> Option<String> {
   if !text.starts_with('"') {
     return None;
   }
-  let end = text[1..].find('"')?;
-  Some(text[1..1 + end].to_owned())
+  first_quoted_string(text)
 }
 
 fn parse_util_global_attributes(remainder: &str) -> Vec<ParsedAttribute> {
@@ -3672,10 +6558,7 @@ fn first_paren_value_count_after_bracket(text: &str) -> usize {
 }
 
 fn named_call_value_count(text: &str, name: &str) -> Option<usize> {
-  let marker = format!("{name}(");
-  let open = text.find(&marker)? + name.len();
-  let close = matching_delimiter(text, open, '(', ')')?;
-  Some(extract_value_names(&text[open + 1..close]).len())
+  Some(extract_value_names(named_call_body(text, name)?).len())
 }
 
 fn named_call_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -5622,5 +8505,1209 @@ fn invalid(message: impl Into<String>) -> ModelError {
   ModelError::InvalidData {
     format: FORMAT,
     message: message.into(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn decodes_builtin_attribute_dictionary_assembly() {
+    let strings = vec!["torch.assume_strict_symbolic_shapes".to_owned()];
+    let name = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(0)];
+    let unit = vec![small_varint(BUILTIN_UNIT_ATTR_KIND)];
+    let dictionary = vec![
+      small_varint(1),
+      small_varint(1),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &name),
+      attr_type_entry("builtin", true, &unit),
+      attr_type_entry("builtin", true, &dictionary),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("{torch.assume_strict_symbolic_shapes = unit}")
+    );
+  }
+
+  #[test]
+  fn decodes_attribute_refs_in_builtin_shaped_types() {
+    let strings = Vec::new();
+    let encoding = b"#encoding\0".to_vec();
+    let f32_type = vec![small_varint(5)];
+    let tensor_type = vec![
+      small_varint(14),
+      small_varint(0),
+      small_varint(1),
+      small_signed_varint(8),
+      small_varint(0),
+    ];
+    let attributes = vec![attr_type_entry("builtin", false, &encoding)];
+    let types = vec![
+      attr_type_entry("builtin", true, &f32_type),
+      attr_type_entry("builtin", true, &tensor_type),
+    ];
+
+    assert_eq!(
+      decode_bytecode_type_assembly(1, &types, &attributes, &strings, 0).as_deref(),
+      Some("tensor<8xf32, #encoding>")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_scalar_type_payloads() {
+    let strings = Vec::new();
+    let attributes = Vec::new();
+    let si32_type = vec![small_varint(13)];
+    let token_type = vec![small_varint(22)];
+    let f4_type = vec![small_varint(37)];
+    let none_type = vec![small_varint(33)];
+    let types = vec![
+      attr_type_entry("vhlo", true, &si32_type),
+      attr_type_entry("vhlo", true, &token_type),
+      attr_type_entry("vhlo", true, &f4_type),
+      attr_type_entry("vhlo", true, &none_type),
+    ];
+
+    assert_eq!(
+      decode_bytecode_type_assembly(0, &types, &attributes, &strings, 0).as_deref(),
+      Some("si32")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(1, &types, &attributes, &strings, 0).as_deref(),
+      Some("!vhlo.token")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(2, &types, &attributes, &strings, 0).as_deref(),
+      Some("f4E2M1FN")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(3, &types, &attributes, &strings, 0).as_deref(),
+      Some("none")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_referenced_type_payloads() {
+    let strings = Vec::new();
+    let attributes = Vec::new();
+    let f32_type = vec![small_varint(4)];
+    let si32_type = vec![small_varint(13)];
+    let complex_type = vec![small_varint(1), small_varint(0)];
+    let function_type = vec![
+      small_varint(8),
+      small_varint(2),
+      small_varint(0),
+      small_varint(1),
+      small_varint(1),
+      small_varint(2),
+    ];
+    let tuple_type = vec![
+      small_varint(23),
+      small_varint(3),
+      small_varint(0),
+      small_varint(1),
+      small_varint(2),
+    ];
+    let future_type = vec![
+      small_varint(42),
+      small_varint(2),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let types = vec![
+      attr_type_entry("vhlo", true, &f32_type),
+      attr_type_entry("vhlo", true, &si32_type),
+      attr_type_entry("vhlo", true, &complex_type),
+      attr_type_entry("vhlo", true, &function_type),
+      attr_type_entry("vhlo", true, &tuple_type),
+      attr_type_entry("vhlo", true, &future_type),
+    ];
+
+    assert_eq!(
+      decode_bytecode_type_assembly(2, &types, &attributes, &strings, 0).as_deref(),
+      Some("complex<f32>")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(3, &types, &attributes, &strings, 0).as_deref(),
+      Some("(f32, si32) -> (complex<f32>)")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(4, &types, &attributes, &strings, 0).as_deref(),
+      Some("tuple<f32, si32, complex<f32>>")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(5, &types, &attributes, &strings, 0).as_deref(),
+      Some("!stablehlo.future<f32, si32>")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_shaped_type_payloads() {
+    let strings = Vec::new();
+    let attributes = Vec::new();
+    let f32_type = vec![small_varint(4)];
+    let si32_type = vec![small_varint(13)];
+    let ranked_tensor_type = vec![
+      small_varint(20),
+      small_varint(2),
+      small_signed_varint(2),
+      small_signed_varint(-1),
+      small_varint(0),
+    ];
+    let unranked_tensor_type = vec![small_varint(25), small_varint(1)];
+    let ranked_buffer_type = vec![
+      small_varint(41),
+      small_varint(1),
+      small_signed_varint(8),
+      small_varint(0),
+    ];
+    let types = vec![
+      attr_type_entry("vhlo", true, &f32_type),
+      attr_type_entry("vhlo", true, &si32_type),
+      attr_type_entry("vhlo", true, &ranked_tensor_type),
+      attr_type_entry("vhlo", true, &unranked_tensor_type),
+      attr_type_entry("vhlo", true, &ranked_buffer_type),
+    ];
+
+    assert_eq!(
+      decode_bytecode_type_assembly(2, &types, &attributes, &strings, 0).as_deref(),
+      Some("tensor<2x?xf32>")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(3, &types, &attributes, &strings, 0).as_deref(),
+      Some("tensor<*xsi32>")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(4, &types, &attributes, &strings, 0).as_deref(),
+      Some("tensor<8xf32>")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_quantized_type_payloads() {
+    let strings = Vec::new();
+    let attributes = Vec::new();
+    let si8_type = vec![small_varint(11)];
+    let f32_type = vec![small_varint(4)];
+    let mut uniform_type = vec![
+      small_varint(24),
+      small_varint(0),
+      small_varint(0),
+      small_varint(1),
+    ];
+    uniform_type.extend(full_width_varint(f64::to_bits(0.5) << 1));
+    uniform_type.push(small_signed_varint(0));
+    uniform_type.extend(signed_varint(-128));
+    uniform_type.extend(signed_varint(127));
+    let mut per_axis_type = vec![
+      small_varint(30),
+      small_varint(0),
+      small_varint(0),
+      small_varint(1),
+      small_varint(1),
+    ];
+    per_axis_type.extend(signed_varint(-128));
+    per_axis_type.extend(signed_varint(127));
+    per_axis_type.push(small_varint(2));
+    per_axis_type.extend(full_width_varint(f64::to_bits(0.25) << 1));
+    per_axis_type.extend(full_width_varint(f64::to_bits(0.5) << 1));
+    per_axis_type.push(small_varint(2));
+    per_axis_type.push(small_signed_varint(0));
+    per_axis_type.push(small_signed_varint(1));
+    let types = vec![
+      attr_type_entry("vhlo", true, &si8_type),
+      attr_type_entry("vhlo", true, &f32_type),
+      attr_type_entry("vhlo", true, &uniform_type),
+      attr_type_entry("vhlo", true, &per_axis_type),
+    ];
+
+    assert_eq!(
+      decode_bytecode_type_assembly(2, &types, &attributes, &strings, 0).as_deref(),
+      Some("!quant.uniform<si8<-128:127>:f32, 0.5>")
+    );
+    assert_eq!(
+      decode_bytecode_type_assembly(3, &types, &attributes, &strings, 0).as_deref(),
+      Some("!quant.uniform<si8<-128:127>:f32:1, {0.25, 0.5:1}>")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_scalar_attribute_payloads() {
+    let strings = vec!["alpha".to_owned()];
+    let f32_type = vec![small_varint(4)];
+    let si32_type = vec![small_varint(13)];
+    let types = vec![
+      attr_type_entry("vhlo", true, &f32_type),
+      attr_type_entry("vhlo", true, &si32_type),
+    ];
+    let bool_attr = vec![small_varint(2), small_varint(1)];
+    let direction_attr = vec![small_varint(3), small_varint(4)];
+    let string_attr = vec![small_varint(14), small_varint(0)];
+    let type_attr = vec![small_varint(17), small_varint(0)];
+    let precision_attr = vec![small_varint(11), small_varint(3)];
+    let attributes = vec![
+      attr_type_entry("vhlo", true, &bool_attr),
+      attr_type_entry("vhlo", true, &direction_attr),
+      attr_type_entry("vhlo", true, &string_attr),
+      attr_type_entry("vhlo", true, &type_attr),
+      attr_type_entry("vhlo", true, &precision_attr),
+    ];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("true")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("LE")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("\"alpha\"")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(3, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("f32")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(4, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("PACKED_NIBBLE")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_container_attribute_payloads() {
+    let strings = vec!["lhs".to_owned()];
+    let types = Vec::new();
+    let name_attr = vec![small_varint(14), small_varint(0)];
+    let bool_attr = vec![small_varint(2), small_varint(1)];
+    let array_attr = vec![
+      small_varint(1),
+      small_varint(2),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let dictionary_attr = vec![
+      small_varint(6),
+      small_varint(1),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let attributes = vec![
+      attr_type_entry("vhlo", true, &name_attr),
+      attr_type_entry("vhlo", true, &bool_attr),
+      attr_type_entry("vhlo", true, &array_attr),
+      attr_type_entry("vhlo", true, &dictionary_attr),
+    ];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("[\"lhs\", true]")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(3, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("{lhs = true}")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_numeric_and_metadata_attribute_payloads() {
+    let strings = Vec::new();
+    let f32_type = vec![small_varint(4)];
+    let si32_type = vec![small_varint(13)];
+    let types = vec![
+      attr_type_entry("vhlo", true, &f32_type),
+      attr_type_entry("vhlo", true, &si32_type),
+    ];
+    let mut float_attr = vec![small_varint(8), small_varint(0)];
+    float_attr.extend(full_width_varint(u64::from(f32::to_bits(1.0)) << 1));
+    let integer_attr = vec![small_varint(9), small_varint(1), small_signed_varint(7)];
+    let output_alias_attr = vec![
+      small_varint(10),
+      small_varint(1),
+      small_signed_varint(0),
+      small_signed_varint(2),
+      small_varint(2),
+      small_signed_varint(1),
+      small_signed_varint(3),
+    ];
+    let type_extensions_attr = vec![
+      small_varint(18),
+      small_varint(2),
+      small_signed_varint(1),
+      small_signed_varint(-1),
+    ];
+    let result_mode_attr = vec![small_varint(19), small_varint(3)];
+    let mut result_accuracy_attr = vec![small_varint(20)];
+    result_accuracy_attr.extend(full_width_varint(f64::to_bits(0.25) << 1));
+    result_accuracy_attr.extend(full_width_varint(f64::to_bits(0.5) << 1));
+    result_accuracy_attr.push(small_signed_varint(3));
+    result_accuracy_attr.push(small_varint(4));
+    let attributes = vec![
+      attr_type_entry("vhlo", true, &float_attr),
+      attr_type_entry("vhlo", true, &integer_attr),
+      attr_type_entry("vhlo", true, &output_alias_attr),
+      attr_type_entry("vhlo", true, &type_extensions_attr),
+      attr_type_entry("vhlo", true, &result_mode_attr),
+      attr_type_entry("vhlo", true, &result_accuracy_attr),
+    ];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("1 : f32")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("7 : si32")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some(
+        "output_operand_alias<output_tuple_indices = [0], operand_index = 2, operand_tuple_indices = [1, 3]>"
+      )
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(3, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("type_extensions<bounds = [1, -1]>")
+    );
+    assert_eq!(
+      decode_bytecode_attr_assembly(5, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("result_accuracy<atol = 0.25, rtol = 0.5, ulps = 3, mode = TOLERANCE>")
+    );
+  }
+
+  #[test]
+  fn decodes_vhlo_tensor_attribute_payload_summary() {
+    let strings = Vec::new();
+    let si8_type = vec![small_varint(11)];
+    let tensor_type = vec![
+      small_varint(20),
+      small_varint(1),
+      small_signed_varint(4),
+      small_varint(0),
+    ];
+    let types = vec![
+      attr_type_entry("vhlo", true, &si8_type),
+      attr_type_entry("vhlo", true, &tensor_type),
+    ];
+    let tensor_attr = vec![
+      small_varint(15),
+      small_varint(1),
+      small_varint(4),
+      1,
+      2,
+      3,
+      4,
+    ];
+    let attributes = vec![attr_type_entry("vhlo", true, &tensor_attr)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("dense<[1, 2, 3, 4]> : tensor<4xsi8>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_module_symbol_property() {
+    let attributes = vec![
+      bytecode_string_attribute(0, "bytecode_module"),
+      bytecode_string_attribute(1, "private"),
+    ];
+    let property_data = vec![small_varint(1), small_varint(3)];
+    let properties = vec![BytecodeProperty {
+      index: 0,
+      len: property_data.len(),
+      data: property_data,
+      preview_hex: String::new(),
+    }];
+    let operation = bytecode_operation("builtin.module", Some(0));
+
+    assert_eq!(
+      decode_bytecode_module_symbol(&operation, &properties, &attributes).as_deref(),
+      Some("bytecode_module")
+    );
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![
+        ("sym_name", "bytecode_module".to_owned()),
+        ("sym_visibility", "private".to_owned())
+      ]
+    );
+  }
+
+  #[test]
+  fn decodes_func_function_property_fields() {
+    let attributes = vec![
+      bytecode_assembly_attribute(0, "(i64) -> i64"),
+      bytecode_string_attribute(1, "main"),
+      bytecode_string_attribute(2, "private"),
+    ];
+    let properties = vec![bytecode_property(
+      0,
+      vec![
+        small_varint(0),
+        small_varint(0),
+        small_varint(0),
+        small_varint(1),
+        small_varint((2 << 1) | 1),
+      ],
+    )];
+    let operation = bytecode_operation("func.func", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![
+        ("function_type", "(i64) -> i64".to_owned()),
+        ("sym_name", "main".to_owned()),
+        ("sym_visibility", "private".to_owned())
+      ]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes).as_deref(),
+      Some("main")
+    );
+  }
+
+  #[test]
+  fn ignores_absent_builtin_module_symbol_property() {
+    let attributes = vec![bytecode_string_attribute(0, "bytecode_module")];
+    let property_data = vec![small_varint(0), small_varint(0)];
+    let properties = vec![BytecodeProperty {
+      index: 0,
+      len: property_data.len(),
+      data: property_data,
+      preview_hex: String::new(),
+    }];
+    let operation = bytecode_operation("builtin.module", Some(0));
+
+    assert_eq!(
+      decode_bytecode_module_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_torch_operator_name_property_as_symbol() {
+    let attributes = vec![bytecode_string_attribute(
+      0,
+      "torch.aten._scaled_dot_product_flash_attention_for_cpu",
+    )];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("torch.operator", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes).as_deref(),
+      Some("torch.aten._scaled_dot_product_flash_attention_for_cpu")
+    );
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![(
+        "name",
+        "torch.aten._scaled_dot_product_flash_attention_for_cpu".to_owned()
+      )]
+    );
+  }
+
+  #[test]
+  fn decodes_func_call_callee_property() {
+    let attributes = vec![bytecode_assembly_attribute(0, "@forward")];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("func.call", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![("callee", "@forward".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_func_call_mixed_property_fields() {
+    let attributes = vec![
+      bytecode_assembly_attribute(0, "[{torch.arg = unit}]"),
+      bytecode_assembly_attribute(1, "@forward"),
+      bytecode_assembly_attribute(2, "unit"),
+      bytecode_assembly_attribute(3, "[{torch.result = unit}]"),
+    ];
+    let properties = vec![bytecode_property(
+      0,
+      vec![
+        small_varint(1),
+        small_varint(1),
+        small_varint(5),
+        small_varint(7),
+      ],
+    )];
+    let operation = bytecode_operation("func.call", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![
+        ("arg_attrs", "[{torch.arg = unit}]".to_owned()),
+        ("callee", "@forward".to_owned()),
+        ("no_inline", "unit".to_owned()),
+        ("res_attrs", "[{torch.result = unit}]".to_owned())
+      ]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_func_constant_symbol_property() {
+    let attributes = vec![bytecode_assembly_attribute(0, "@forward")];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("func.constant", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![("value", "@forward".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes).as_deref(),
+      Some("@forward")
+    );
+  }
+
+  #[test]
+  fn decodes_arith_constant_value_property() {
+    let attributes = vec![bytecode_assembly_attribute(0, "42 : i32")];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("arith.constant", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![("value", "42 : i32".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_torch_constant_string_property_value() {
+    let attributes = vec![bytecode_string_attribute(0, "cuda:0")];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("torch.constant.device", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![("value", "cuda:0".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_torch_constant_numeric_property_values() {
+    let attributes = vec![
+      bytecode_assembly_attribute(0, "42 : i64"),
+      bytecode_assembly_attribute(1, "0.5 : f64"),
+      bytecode_assembly_attribute(2, "true"),
+    ];
+    let properties = vec![
+      bytecode_property(0, vec![small_varint(0)]),
+      bytecode_property(1, vec![small_varint(1)]),
+      bytecode_property(2, vec![small_varint(2)]),
+    ];
+    let int_operation = bytecode_operation("torch.constant.int", Some(0));
+    let float_operation = bytecode_operation("torch.constant.float", Some(1));
+    let bool_operation = bytecode_operation("torch.constant.bool", Some(2));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&int_operation, &properties, &attributes),
+      vec![("value", "42 : i64".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&float_operation, &properties, &attributes),
+      vec![("value", "0.5 : f64".to_owned())]
+    );
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&bool_operation, &properties, &attributes),
+      vec![("value", "true".to_owned())]
+    );
+  }
+
+  #[test]
+  fn decodes_torch_constant_none_intrinsic_metadata() {
+    let operation = bytecode_operation("torch.constant.none", None);
+
+    assert_eq!(
+      decode_bytecode_operation_intrinsic_metadata(&operation),
+      vec![
+        ("constant.value", "none".to_owned()),
+        ("constant.type", "none".to_owned())
+      ]
+    );
+  }
+
+  #[test]
+  fn decodes_torch_vtensor_literal_value_property() {
+    let attributes = vec![bytecode_assembly_attribute(
+      0,
+      "dense_resource<token_ids> : tensor<1x77xsi64>",
+    )];
+    let properties = vec![bytecode_property(0, vec![small_varint(0)])];
+    let operation = bytecode_operation("torch.vtensor.literal", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![(
+        "value",
+        "dense_resource<token_ids> : tensor<1x77xsi64>".to_owned()
+      )]
+    );
+  }
+
+  #[test]
+  fn decodes_util_global_symbol_property() {
+    let attributes = vec![
+      bytecode_string_attribute(0, "__auto.weight"),
+      bytecode_assembly_attribute(1, "!torch.vtensor<[2,3],f32>"),
+      bytecode_assembly_attribute(2, "dense<0.0> : tensor<2x3xf32>"),
+      bytecode_assembly_attribute(3, "unit"),
+    ];
+    let properties = vec![bytecode_property(
+      0,
+      vec![
+        small_varint(5),
+        small_varint(0),
+        small_varint(7),
+        small_varint(0),
+        small_varint(0),
+        small_varint(1),
+      ],
+    )];
+    let operation = bytecode_operation("util.global", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes).as_deref(),
+      Some("__auto.weight")
+    );
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![
+        ("initial_value", "dense<0.0> : tensor<2x3xf32>".to_owned()),
+        ("is_mutable", "unit".to_owned()),
+        ("sym_name", "__auto.weight".to_owned()),
+        ("type", "!torch.vtensor<[2,3],f32>".to_owned())
+      ]
+    );
+  }
+
+  #[test]
+  fn decodes_util_global_load_ref_property() {
+    let attributes = vec![
+      bytecode_assembly_attribute(0, "@__auto.weight"),
+      bytecode_assembly_attribute(1, "unit"),
+    ];
+    let properties = vec![bytecode_property(0, vec![small_varint(0), small_varint(3)])];
+    let operation = bytecode_operation("util.global.load", Some(0));
+
+    assert_eq!(
+      decode_bytecode_operation_string_properties(&operation, &properties, &attributes),
+      vec![
+        ("global", "@__auto.weight".to_owned()),
+        ("is_immutable", "unit".to_owned())
+      ]
+    );
+    assert_eq!(
+      decode_bytecode_operation_symbol(&operation, &properties, &attributes),
+      None
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_integer_attr_assembly() {
+    let strings = Vec::new();
+    let integer_type = b"i32\0".to_vec();
+    let integer_attr = vec![
+      small_varint(BUILTIN_INTEGER_ATTR_KIND),
+      small_varint(0),
+      small_signed_varint(7),
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &integer_attr)];
+    let types = vec![attr_type_entry("builtin", false, &integer_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("7 : i32")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_float_attr_assembly() {
+    let strings = Vec::new();
+    let float_type = b"f64\0".to_vec();
+    let mut float_attr = vec![small_varint(BUILTIN_FLOAT_ATTR_KIND), small_varint(0)];
+    float_attr.extend(full_width_varint(f64::to_bits(1.0) << 1));
+    let attributes = vec![attr_type_entry("builtin", true, &float_attr)];
+    let types = vec![attr_type_entry("builtin", false, &float_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("1 : f64")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_dense_resource_elements_attr_summary() {
+    let strings = Vec::new();
+    let tensor_type = b"tensor<4xf32>\0".to_vec();
+    let dense_resource = vec![
+      small_varint(BUILTIN_DENSE_RESOURCE_ELEMENTS_ATTR_KIND),
+      small_varint(0),
+      small_varint(0),
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &dense_resource)];
+    let types = vec![attr_type_entry("builtin", false, &tensor_type)];
+    let resources = vec![BytecodeResource {
+      scope: "builtin".to_owned(),
+      name: "weights".to_owned(),
+      kind: "blob".to_owned(),
+    }];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &resources, 0).as_deref(),
+      Some("dense_resource<weights> : tensor<4xf32>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_dense_array_attr_summary() {
+    let strings = Vec::new();
+    let i8_type = vec![small_varint(0), small_varint(8 << 2)];
+    let dense_array = vec![
+      small_varint(BUILTIN_DENSE_ARRAY_ATTR_KIND),
+      small_varint(0),
+      small_varint(3),
+      small_varint(3),
+      1,
+      2,
+      3,
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &dense_array)];
+    let types = vec![attr_type_entry("builtin", true, &i8_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("array<i8: 3 values, 3 bytes>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_dense_numeric_elements_attr_summary() {
+    let strings = Vec::new();
+    let tensor_type = b"tensor<4xi8>\0".to_vec();
+    let dense_elements = vec![
+      small_varint(BUILTIN_DENSE_INT_OR_FP_ELEMENTS_ATTR_KIND),
+      small_varint(0),
+      small_varint(4),
+      1,
+      2,
+      3,
+      4,
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &dense_elements)];
+    let types = vec![attr_type_entry("builtin", false, &tensor_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("dense<[1, 2, 3, 4]> : tensor<4xi8>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_dense_numeric_elements_attr_preview_limit() {
+    let strings = Vec::new();
+    let tensor_type = b"tensor<10xf32>\0".to_vec();
+    let mut dense_elements = vec![
+      small_varint(BUILTIN_DENSE_INT_OR_FP_ELEMENTS_ATTR_KIND),
+      small_varint(0),
+      small_varint(40),
+    ];
+    for value in 1..=10 {
+      dense_elements.extend(f32::to_le_bytes(value as f32));
+    }
+    let attributes = vec![attr_type_entry("builtin", true, &dense_elements)];
+    let types = vec![attr_type_entry("builtin", false, &tensor_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("dense<[1, 2, 3, 4, 5, 6, 7, 8, ... 2 more]> : tensor<10xf32>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_dense_string_elements_attr_summary() {
+    let strings = vec!["alpha".to_owned(), "beta".to_owned()];
+    let tensor_type = b"tensor<2x!bytecode.string>\0".to_vec();
+    let dense_strings = vec![
+      small_varint(BUILTIN_DENSE_STRING_ELEMENTS_ATTR_KIND),
+      small_varint(0),
+      small_varint(0),
+      small_varint(2),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &dense_strings)];
+    let types = vec![attr_type_entry("builtin", false, &tensor_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("dense<[\"alpha\", \"beta\"]> : tensor<2x!bytecode.string>")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_sparse_elements_attr_summary() {
+    let strings = Vec::new();
+    let tensor_type = b"tensor<2xi32>\0".to_vec();
+    let sparse = vec![
+      small_varint(BUILTIN_SPARSE_ELEMENTS_ATTR_KIND),
+      small_varint(0),
+      small_varint(1),
+      small_varint(2),
+    ];
+    let indices = b"dense<[[0]]> : tensor<1x1xi64>\0".to_vec();
+    let values = b"dense<[42]> : tensor<1xi32>\0".to_vec();
+    let attributes = vec![
+      attr_type_entry("builtin", true, &sparse),
+      attr_type_entry("builtin", false, &indices),
+      attr_type_entry("builtin", false, &values),
+    ];
+    let types = vec![attr_type_entry("builtin", false, &tensor_type)];
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some(
+        "sparse<indices = dense<[[0]]> : tensor<1x1xi64>, values = dense<[42]> : tensor<1xi32>> : tensor<2xi32>"
+      )
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_distinct_attr_summary() {
+    let strings = vec!["marker".to_owned()];
+    let referenced = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(0)];
+    let distinct = vec![small_varint(BUILTIN_DISTINCT_ATTR_KIND), small_varint(0)];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &referenced),
+      attr_type_entry("builtin", true, &distinct),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("distinct<\"marker\">")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_file_line_col_location_attr_assembly() {
+    let strings = vec!["kernel.mlir".to_owned()];
+    let filename = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(0)];
+    let location = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_LEGACY_OR_RANGE_KIND),
+      small_varint(0),
+      small_varint(12),
+      small_varint(34),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &filename),
+      attr_type_entry("builtin", true, &location),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"kernel.mlir\":12:34)")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_file_line_col_range_location_attr_assembly() {
+    let strings = vec!["kernel.mlir".to_owned()];
+    let filename = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(0)];
+    let location = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_LEGACY_OR_RANGE_KIND),
+      small_varint(0),
+      small_varint(4),
+      small_varint(4),
+      small_varint(12),
+      small_varint(6),
+      small_varint(18),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &filename),
+      attr_type_entry("builtin", true, &location),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"kernel.mlir\":4:12 to 6:18)")
+    );
+  }
+
+  #[test]
+  fn decodes_current_builtin_file_line_col_range_location_attr_assembly() {
+    let strings = vec!["range.mlir".to_owned()];
+    let location = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(0),
+      small_varint(4),
+      small_varint(3),
+      small_varint(5),
+      small_varint(7),
+      small_varint(11),
+    ];
+    let attributes = vec![attr_type_entry("builtin", true, &location)];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"range.mlir\":3:5 to 7:11)")
+    );
+  }
+
+  #[test]
+  fn decodes_builtin_call_site_location_attr_assembly() {
+    let strings = vec!["callee.mlir".to_owned(), "caller.mlir".to_owned()];
+    let callee = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(0),
+      small_varint(2),
+      small_varint(11),
+      small_varint(13),
+    ];
+    let caller = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(1),
+      small_varint(2),
+      small_varint(17),
+      small_varint(19),
+    ];
+    let call_site = vec![
+      small_varint(BUILTIN_CALL_SITE_LOC_KIND),
+      small_varint(0),
+      small_varint(1),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &callee),
+      attr_type_entry("builtin", true, &caller),
+      attr_type_entry("builtin", true, &call_site),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(callsite(\"callee.mlir\":11:13 at \"caller.mlir\":17:19))")
+    );
+    let location = decode_builtin_location(2, &attributes, &strings, 0).expect("call site loc");
+    assert_eq!(location.kind, "call_site");
+    assert_eq!(location.file.as_deref(), Some("callee.mlir"));
+    assert_eq!(location.line, Some(11));
+    assert_eq!(location.column, Some(13));
+  }
+
+  #[test]
+  fn decodes_current_builtin_fused_location_attr_assembly() {
+    let strings = vec!["fused.mlir".to_owned()];
+    let child = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(0),
+      small_varint(2),
+      small_varint(8),
+      small_varint(13),
+    ];
+    let fused = vec![
+      small_varint(BUILTIN_FUSED_OR_FILE_LINE_COL_LOC_KIND),
+      small_varint(1),
+      small_varint(0),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &child),
+      attr_type_entry("builtin", true, &fused),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(1, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"fused.mlir\":8:13)")
+    );
+  }
+
+  #[test]
+  fn decodes_current_builtin_fused_location_with_metadata_attr_assembly() {
+    let strings = vec!["meta.mlir".to_owned(), "tag".to_owned()];
+    let child = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(0),
+      small_varint(2),
+      small_varint(21),
+      small_varint(34),
+    ];
+    let metadata = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(1)];
+    let fused = vec![
+      small_varint(BUILTIN_FUSED_LOC_WITH_METADATA_KIND),
+      small_varint(1),
+      small_varint(1),
+      small_varint(0),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &child),
+      attr_type_entry("builtin", true, &metadata),
+      attr_type_entry("builtin", true, &fused),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"meta.mlir\":21:34)")
+    );
+  }
+
+  #[test]
+  fn decodes_current_builtin_name_location_attr_assembly() {
+    let strings = vec!["name.mlir".to_owned(), "callee".to_owned()];
+    let child = vec![
+      small_varint(BUILTIN_FILE_LINE_COL_RANGE_KIND),
+      small_varint(0),
+      small_varint(2),
+      small_varint(55),
+      small_varint(89),
+    ];
+    let name = vec![small_varint(BUILTIN_STRING_ATTR_KIND), small_varint(1)];
+    let location = vec![
+      small_varint(BUILTIN_NAME_LOC_KIND),
+      small_varint(1),
+      small_varint(0),
+    ];
+    let attributes = vec![
+      attr_type_entry("builtin", true, &child),
+      attr_type_entry("builtin", true, &name),
+      attr_type_entry("builtin", true, &location),
+    ];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(2, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(\"name.mlir\":55:89)")
+    );
+  }
+
+  #[test]
+  fn decodes_current_builtin_unknown_location_attr_assembly() {
+    let strings = Vec::new();
+    let location = vec![small_varint(BUILTIN_LEGACY_NAME_OR_UNKNOWN_LOC_KIND)];
+    let attributes = vec![attr_type_entry("builtin", true, &location)];
+    let types = Vec::new();
+
+    assert_eq!(
+      decode_bytecode_attr_assembly(0, &attributes, &types, &strings, &[], 0).as_deref(),
+      Some("loc(unknown)")
+    );
+  }
+
+  fn attr_type_entry<'a>(
+    dialect: &'a str,
+    has_custom_encoding: bool,
+    data: &'a [u8],
+  ) -> BytecodeAttrTypeEntry<'a> {
+    BytecodeAttrTypeEntry {
+      dialect,
+      has_custom_encoding,
+      data,
+    }
+  }
+
+  fn bytecode_string_attribute(index: usize, value: &str) -> BytecodeAttribute {
+    BytecodeAttribute {
+      index,
+      dialect: "builtin".to_owned(),
+      has_custom_encoding: true,
+      len: value.len(),
+      string: Some(value.to_owned()),
+      assembly: Some(quote_bytecode_string(value)),
+      preview_hex: String::new(),
+    }
+  }
+
+  fn bytecode_assembly_attribute(index: usize, value: &str) -> BytecodeAttribute {
+    BytecodeAttribute {
+      index,
+      dialect: "builtin".to_owned(),
+      has_custom_encoding: true,
+      len: value.len(),
+      string: None,
+      assembly: Some(value.to_owned()),
+      preview_hex: String::new(),
+    }
+  }
+
+  fn bytecode_property(index: usize, data: Vec<u8>) -> BytecodeProperty {
+    BytecodeProperty {
+      index,
+      len: data.len(),
+      data,
+      preview_hex: String::new(),
+    }
+  }
+
+  fn bytecode_operation(name: &str, properties: Option<usize>) -> BytecodeIrOperation {
+    BytecodeIrOperation {
+      name: name.to_owned(),
+      operation: 0,
+      region: 0,
+      block: 0,
+      location: None,
+      attributes: None,
+      properties,
+      operands: Vec::new(),
+      results: Vec::new(),
+      nested_regions: 0,
+      nested_region_ids: Vec::new(),
+    }
+  }
+
+  fn small_varint(value: usize) -> u8 {
+    assert!(value <= 127);
+    ((value << 1) | 1) as u8
+  }
+
+  fn small_signed_varint(value: i64) -> u8 {
+    let raw = ((value << 1) ^ (value >> 63)) as usize;
+    small_varint(raw)
+  }
+
+  fn signed_varint(value: i64) -> Vec<u8> {
+    let raw = ((value << 1) ^ (value >> 63)) as u64;
+    if raw <= 127 {
+      vec![small_varint(raw as usize)]
+    } else {
+      full_width_varint(raw).to_vec()
+    }
+  }
+
+  fn full_width_varint(value: u64) -> [u8; 9] {
+    let mut bytes = [0; 9];
+    bytes[1..].copy_from_slice(&value.to_le_bytes());
+    bytes
   }
 }

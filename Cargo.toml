@@ -17,6 +17,7 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

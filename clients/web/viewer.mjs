@@ -1,4 +1,4 @@
-import { ProjectionClient, initialLayoutHandle, overviewRows, summaryLists } from './protocol.mjs';
+import { HttpTransport, ProjectionClient, canOpenLocation, formatLocation, handleLabel, initialLayoutHandle, mlirNavigationRows, overviewRows, summaryLists } from './protocol.mjs';
 
 const state = {
     client: null,
@@ -39,10 +39,17 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('cancel-button').addEventListener('click', cancelRequests);
 
     const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
-    const transport = vscode ? new VsCodeTransport(vscode) : new DemoTransport();
+    const http = vscode ? null : httpConfigFromLocation();
+    const transport = vscode
+        ? new VsCodeTransport(vscode)
+        : http
+            ? new HttpTransport(http.endpoint, http.token)
+            : new DemoTransport();
     state.client = new ProjectionClient(transport);
     if (vscode) {
         vscode.postMessage({ type: 'ready' });
+    } else if (http) {
+        openHttp(http.path);
     } else {
         openDemo();
     }
@@ -81,6 +88,16 @@ async function openDemo() {
     receiveOpen({ status: 'ok', data }, false);
 }
 
+async function openHttp(path) {
+    try {
+        setStatus('Opening indexed session');
+        const data = await state.client.open(path);
+        receiveOpen({ status: 'ok', data }, false);
+    } catch (error) {
+        setStatus(error.message);
+    }
+}
+
 async function runSearch() {
     const query = nodes.search.value.trim();
     const requestId = nextRequest('search');
@@ -94,8 +111,7 @@ async function runSearch() {
             return;
         }
         renderVirtualList(nodes.results, results, (entry) => searchRow(entry), (entry) => {
-            state.selectedHandle = entry.handle;
-            requestDetail(entry.handle);
+            selectHandle(entry.handle);
         });
         renderRequestLog();
     } catch (error) {
@@ -132,7 +148,7 @@ async function requestLayout() {
     const requestId = nextRequest('layout');
     try {
         setStatus('Loading layout');
-        const layout = await state.client.layout(handle, 500);
+        const layout = await state.client.layout(handle, 500, layoutCollapseMode(handle));
         if (requestStale('layout', requestId)) {
             return;
         }
@@ -144,6 +160,10 @@ async function requestLayout() {
         }
         setStatus(error.message);
     }
+}
+
+function layoutCollapseMode(handle) {
+    return handle?.kind?.startsWith('mlir_') ? 'structural' : 'none';
 }
 
 async function requestDiagnostics() {
@@ -182,14 +202,9 @@ async function requestMlirSymbols() {
         if (requestStale('metadata', requestId)) {
             return;
         }
-        const rows = Array.isArray(symbols) ? symbols : [];
-        renderVirtualList(nodes.metadata, rows, (symbol) => symbol.name || compactRow(symbol), (symbol) => {
-            if (symbol.handle) {
-                state.selectedHandle = symbol.handle;
-                requestDetail(symbol.handle);
-            }
-        });
-        setStatus(`Symbols ${rows.length}`);
+        const symbolsRows = Array.isArray(symbols) ? symbols : [];
+        renderMlirNavigation(symbolsRows);
+        setStatus(`MLIR navigation ${symbolsRows.length} symbols`);
         renderRequestLog();
     } catch (error) {
         if (requestStale('metadata', requestId)) {
@@ -231,8 +246,7 @@ async function requestOnnxTensors() {
         }
         renderVirtualList(nodes.metadata, tensors, tensorRow, (tensor) => {
             if (tensor.handle) {
-                state.selectedHandle = tensor.handle;
-                requestDetail(tensor.handle);
+                selectHandle(tensor.handle);
             }
         });
         setStatus(total > tensorCount ? `Tensors ${tensorCount} of ${total}` : `Tensors ${tensors.length}`);
@@ -258,18 +272,38 @@ function renderSummary(summary) {
         list.className = 'virtual-list';
         renderVirtualList(list, rows, compactRow, (row) => {
             if (row.handle) {
-                state.selectedHandle = row.handle;
-                requestDetail(row.handle);
+                selectHandle(row.handle);
             }
         });
         section.append(heading, list);
         return section;
     }));
-    nodes.metadata.replaceChildren();
+    if (summary.format === 'mlir') {
+        renderMlirNavigation([]);
+    } else {
+        nodes.metadata.replaceChildren();
+    }
     nodes.detail.replaceChildren();
     renderVirtualList(nodes.diagnostics, []);
     drawEmptyLayout();
     renderRequestLog();
+}
+
+function selectHandle(handle) {
+    if (!handle) {
+        return;
+    }
+    state.selectedHandle = handle;
+    requestDetail(handle);
+}
+
+function renderMlirNavigation(symbols) {
+    const rows = mlirNavigationRows(state.summary, symbols);
+    renderVirtualList(nodes.metadata, rows, mlirNavigationRow, (row) => {
+        if (row.handle) {
+            selectHandle(row.handle);
+        }
+    });
 }
 
 function nextRequest(kind) {
@@ -282,6 +316,7 @@ function requestStale(kind, requestId) {
 }
 
 function cancelRequests(showStatus = true) {
+    state.client?.cancelPending?.();
     for (const kind of Object.keys(state.requestEpoch)) {
         state.requestEpoch[kind] += 1;
     }
@@ -315,8 +350,14 @@ function renderVirtualList(container, rows, label = compactRow, onClick = null) 
         const row = document.createElement('button');
         row.className = 'list-row';
         row.style.transform = `translateY(${index * rowHeight}px)`;
+        row.style.paddingLeft = `${6 + Number(rows[index]?.depth || 0) * 14}px`;
         row.textContent = label(rows[index]);
-        if (onClick) {
+        if (rows[index]?.kind) {
+            row.dataset.kind = rows[index].kind;
+        }
+        if (rows[index]?.kind === 'group') {
+            row.disabled = true;
+        } else if (onClick) {
             row.addEventListener('click', () => onClick(rows[index]));
         }
         spacer.append(row);
@@ -337,6 +378,11 @@ function compactRow(row) {
         return `${row.key}: ${row.count}`;
     }
     return row.name || row.key || row.operator || row.title || JSON.stringify(row.handle || row);
+}
+
+function mlirNavigationRow(row) {
+    const detail = row.detail ? ` · ${row.detail}` : '';
+    return `${row.label}${detail}`;
 }
 
 function searchRow(entry) {
@@ -365,7 +411,53 @@ function renderDetail(detail) {
         row.append(key, text);
         fragment.append(row);
     }
+    if (Array.isArray(detail.locations) && detail.locations.length) {
+        const heading = document.createElement('h2');
+        heading.textContent = 'Locations';
+        const list = document.createElement('div');
+        list.className = 'location-list';
+        for (const location of detail.locations) {
+            const canOpen = canOpenLocation(location);
+            const row = document.createElement(canOpen ? 'button' : 'div');
+            row.className = canOpen ? 'location-row location-link' : 'location-row';
+            if (canOpen) {
+                row.type = 'button';
+                row.addEventListener('click', () => openLocation(location));
+            }
+            const kind = document.createElement('span');
+            kind.textContent = location.kind || 'location';
+            const text = document.createElement('code');
+            text.textContent = formatLocation(location);
+            row.append(kind, text);
+            list.append(row);
+        }
+        fragment.append(heading, list);
+    }
+    if (Array.isArray(detail.related) && detail.related.length) {
+        const heading = document.createElement('h2');
+        heading.textContent = 'Related';
+        const related = document.createElement('div');
+        related.className = 'related-list';
+        for (const handle of detail.related) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'detail-link';
+            button.textContent = handleLabel(handle);
+            button.addEventListener('click', () => selectHandle(handle));
+            related.append(button);
+        }
+        fragment.append(heading, related);
+    }
     return fragment;
+}
+
+function openLocation(location) {
+    const label = formatLocation(location);
+    if (state.client?.openLocation(location)) {
+        setStatus(`Opening ${label}`);
+    } else {
+        setStatus(label);
+    }
 }
 
 function drawEmptyLayout() {
@@ -430,6 +522,14 @@ function debounce(callback, delay) {
     };
 }
 
+function httpConfigFromLocation() {
+    const params = new URLSearchParams(window.location.search);
+    const endpoint = params.get('endpoint') || params.get('netron_endpoint');
+    const token = params.get('token') || params.get('netron_token');
+    const path = params.get('path') || params.get('model') || params.get('netron_path');
+    return endpoint && token && path ? { endpoint, token, path } : null;
+}
+
 class VsCodeTransport {
     constructor(vscode) {
         this.vscode = vscode;
@@ -440,17 +540,37 @@ class VsCodeTransport {
             if (!message || !this.pending.has(message.id)) {
                 return;
             }
-            this.pending.get(message.id)(message.response);
+            this.pending.get(message.id).resolve(message.response);
             this.pending.delete(message.id);
         });
     }
 
     request(method, params) {
-        const id = this.nextId++;
+        const id = String(this.nextId++);
+        const cancelable = method === 'layout' || method === 'slice';
+        const requestParams = cancelable ? { ...params, cancel_token: id } : params;
         return new Promise((resolve) => {
-            this.pending.set(id, resolve);
-            this.vscode.postMessage({ id, method, params });
+            this.pending.set(id, { resolve, method });
+            this.vscode.postMessage({ id, method, params: requestParams });
         });
+    }
+
+    cancelPending(session = null) {
+        for (const [id, pending] of this.pending.entries()) {
+            if (pending.method !== 'layout' && pending.method !== 'slice') {
+                continue;
+            }
+            const params = { cancel_token: id };
+            if (session !== null && session !== undefined) {
+                params.session = session;
+            }
+            this.vscode.postMessage({ id: `cancel:${id}`, method: 'cancel', params });
+        }
+    }
+
+    openLocation(location) {
+        this.vscode.postMessage({ type: 'openLocation', location });
+        return true;
     }
 }
 

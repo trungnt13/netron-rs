@@ -14,4 +14,4 @@ pub use model::{
   FunctionValue, Graph, Model, ModelMetadata, Node, Operator, OperatorSet, Quantization,
   QuantizationAnnotation, Tensor, TensorElementType, TensorStorage, TypeInfo, Value,
 };
-pub use normalize::{NormalizedModel, ToNormalizedJson};
+pub use normalize::{BoundedNormalizedModel, NormalizedModel, ToNormalizedJson};

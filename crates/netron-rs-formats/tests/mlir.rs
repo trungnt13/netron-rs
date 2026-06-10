@@ -1,5 +1,5 @@
 use netron_rs_core::ModelError;
-use netron_rs_formats::{ModelInput, ToNormalizedJson, parse};
+use netron_rs_formats::{ModelInput, ToNormalizedJson, inspect_mlir_bytecode, parse};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -19,28 +19,244 @@ fn parses_mlir_bytecode_header_dialects_and_ir_summary() {
   assert_eq!(model.format.name, "MLIR");
   assert_eq!(model.format.version.as_deref(), Some("Bytecode v6"));
   assert_eq!(model.metadata.producer.as_deref(), Some("MLIR19.0.0git"));
-  assert_eq!(
-    model
-      .metadata
-      .properties
-      .get("bytecode.version")
-      .map(String::as_str),
-    Some("6")
+  let summary = inspect_mlir_bytecode(&data)
+    .expect("bytecode inspection")
+    .expect("bytecode summary");
+  assert_eq!(summary.version, 6);
+  assert_eq!(summary.producer, "MLIR19.0.0git");
+  assert!(summary.string_count > 0);
+  assert!(
+    summary
+      .operation_names
+      .iter()
+      .any(|name| name == "func.func")
+  );
+  assert!(!summary.ir.operations.is_empty());
+  assert!(
+    summary
+      .ir
+      .operations
+      .iter()
+      .any(|operation| !operation.operands.is_empty() || !operation.results.is_empty())
   );
   assert!(
-    model
-      .metadata
-      .properties
-      .get("bytecode.dialects")
-      .is_some_and(|dialects| dialects.contains("torch"))
+    summary
+      .ir
+      .operations
+      .iter()
+      .any(|operation| operation.attributes.is_some() || operation.properties.is_some())
   );
+  assert_eq!(summary.property_count, summary.properties.len());
+  let property_index = summary
+    .ir
+    .operations
+    .iter()
+    .find_map(|operation| operation.properties)
+    .expect("operation should reference bytecode properties");
+  let property = &summary.properties[property_index];
+  assert_eq!(property.index, property_index);
+  assert!(property.len > 0);
+  assert!(!property.preview_hex.is_empty());
+  assert_eq!(summary.attribute_count, summary.attributes.len());
+  assert!(!summary.attributes.is_empty());
+  assert!(
+    summary
+      .attributes
+      .iter()
+      .enumerate()
+      .all(|(index, entry)| { entry.index == index && !entry.dialect.is_empty() && entry.len > 0 })
+  );
+  assert!(
+    summary
+      .attributes
+      .iter()
+      .any(|entry| !entry.preview_hex.is_empty())
+  );
+  assert!(summary.attributes.iter().any(|entry| {
+    entry
+      .assembly
+      .as_deref()
+      .is_some_and(|assembly| assembly.starts_with("\"./stable_diffusion_3_medium_diffusers"))
+  }));
+  assert!(
+    summary
+      .attributes
+      .iter()
+      .any(|entry| entry.assembly.as_deref() == Some("0.000001 : f64"))
+  );
+  assert!(summary.attributes.iter().any(|entry| {
+    entry.assembly.as_deref().is_some_and(|assembly| {
+      assembly.starts_with("loc(\"./stable_diffusion_3_medium_diffusers_bs1_77_1024x1024_fp16")
+    })
+  }));
+  assert_eq!(summary.type_count, summary.types.len());
+  assert!(!summary.types.is_empty());
+  assert!(
+    summary
+      .types
+      .iter()
+      .enumerate()
+      .all(|(index, entry)| { entry.index == index && !entry.dialect.is_empty() && entry.len > 0 })
+  );
+  assert!(
+    summary
+      .types
+      .iter()
+      .any(|entry| !entry.preview_hex.is_empty())
+  );
+  let assembly_type = summary
+    .types
+    .iter()
+    .find(|entry| !entry.has_custom_encoding && entry.assembly.is_some())
+    .expect("assembly fallback bytecode type");
+  assert!(
+    assembly_type
+      .assembly
+      .as_deref()
+      .is_some_and(|assembly| assembly.starts_with('!'))
+  );
+  assert_eq!(
+    summary.types[0].assembly.as_deref(),
+    Some("tensor<1536xf16>")
+  );
+  assert!(summary.types.iter().any(|entry| {
+    entry.has_custom_encoding
+      && entry.dialect == "builtin"
+      && entry
+        .assembly
+        .as_deref()
+        .is_some_and(|assembly| assembly.starts_with("tensor<"))
+  }));
+  assert!(summary.ir.values.iter().any(|value| {
+    value
+      .type_index
+      .and_then(|type_index| summary.types.get(type_index))
+      .and_then(|entry| entry.assembly.as_deref())
+      .is_some()
+  }));
+  assert!(!summary.ir.values.is_empty());
+  assert!(summary.ir.values.iter().all(|value| {
+    value
+      .type_index
+      .is_none_or(|type_index| type_index < summary.type_count)
+  }));
+  assert!(
+    summary
+      .ir
+      .values
+      .iter()
+      .any(|value| value.kind == "operation_result" && value.type_index.is_some())
+  );
+  assert!(
+    summary
+      .ir
+      .values
+      .iter()
+      .any(|value| value.kind == "block_argument" && value.type_index.is_some())
+  );
+  assert!(!summary.locations.is_empty());
+  let decoded_location = summary
+    .ir
+    .operations
+    .iter()
+    .find_map(|operation| {
+      let location = operation.location?;
+      summary
+        .locations
+        .iter()
+        .find(|decoded| decoded.attribute == location)
+    })
+    .expect("operation location should decode");
+  assert!(
+    decoded_location
+      .file
+      .as_deref()
+      .is_some_and(|file| file.ends_with(".mlir"))
+  );
+  assert!(decoded_location.line.is_some());
+  assert!(!summary.sections.is_empty());
+  assert!(!model.metadata.properties.contains_key("bytecode.version"));
   assert_eq!(model.graphs.len(), 1);
   assert!(!model.functions.is_empty());
-  assert!(model.graphs[0].nodes.len() > 10);
-  assert!(model.graphs[0].nodes.iter().any(|node| {
-    model.strings.get(node.operator.name) == "func.func"
-      || model.strings.get(node.operator.name) == "builtin.module"
+  assert_eq!(model.strings.get(model.functions[0].name), "run_forward");
+  assert_eq!(model.graphs[0].nodes.len(), 1);
+  assert!(model.functions[0].nodes.len() > 10);
+  assert!(!model.functions[0].values.is_empty());
+  let decoded_bytecode_values = model.functions[0]
+    .values
+    .iter()
+    .filter(|value| value.metadata.contains_key("bytecode.value.kind"))
+    .collect::<Vec<_>>();
+  assert!(!decoded_bytecode_values.is_empty());
+  assert!(decoded_bytecode_values.iter().all(|value| {
+    model.strings.get(value.name).starts_with('%')
+      && value
+        .metadata
+        .get("bytecode.value")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .is_some()
   }));
+  assert!(
+    decoded_bytecode_values
+      .iter()
+      .filter(|value| value
+        .metadata
+        .get("bytecode.value.kind")
+        .is_some_and(|kind| kind == "block_argument"))
+      .all(|value| {
+        let name = model.strings.get(value.name);
+        name.starts_with("%arg") || name.starts_with("%bb")
+      })
+  );
+  assert!(decoded_bytecode_values.iter().any(|value| {
+    value
+      .metadata
+      .get("bytecode.value.kind")
+      .is_some_and(|kind| kind == "operation_result")
+      && model
+        .strings
+        .get(value.name)
+        .strip_prefix('%')
+        .is_some_and(|name| name.chars().all(|ch| ch.is_ascii_digit()))
+  }));
+  assert!(
+    model.functions[0]
+      .nodes
+      .iter()
+      .any(|node| !node.inputs.is_empty() || !node.outputs.is_empty())
+  );
+  assert!(
+    model.functions[0]
+      .nodes
+      .iter()
+      .any(|node| model.strings.get(node.operator.name) == "func.func")
+  );
+  let func_op = model.functions[0]
+    .nodes
+    .iter()
+    .find(|node| model.strings.get(node.operator.name) == "func.func")
+    .expect("decoded bytecode func.func operation");
+  assert_eq!(
+    func_op.metadata.get("bytecode.symbol").map(String::as_str),
+    Some("run_forward")
+  );
+  assert_eq!(
+    func_op
+      .metadata
+      .get("bytecode.attributes.assembly")
+      .map(String::as_str),
+    Some("{torch.assume_strict_symbolic_shapes = unit}")
+  );
+  let func_attributes = func_op
+    .metadata
+    .get("bytecode.attributes")
+    .and_then(|index| index.parse::<usize>().ok())
+    .and_then(|index| summary.attributes.get(index))
+    .expect("func.func bytecode attributes decode");
+  assert_eq!(
+    func_attributes.assembly.as_deref(),
+    Some("{torch.assume_strict_symbolic_shapes = unit}")
+  );
 }
 
 #[test]

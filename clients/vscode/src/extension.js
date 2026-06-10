@@ -55,6 +55,10 @@ class NetronOverviewProvider {
         });
         return;
       }
+      if (message?.type === 'openLocation') {
+        await this.openLocation(document, message.location);
+        return;
+      }
       if (!message || typeof message.method !== 'string') {
         return;
       }
@@ -78,6 +82,52 @@ class NetronOverviewProvider {
         .then((data) => this.service.close(data.session))
         .catch(() => {});
     });
+  }
+
+  async openLocation(document, location) {
+    if (!location || !Number.isInteger(location.line) || location.line < 1) {
+      return;
+    }
+    const targetUri = this.locationUri(document, location.file);
+    try {
+      const targetDocument = await vscode.workspace.openTextDocument(targetUri);
+      const editor = await vscode.window.showTextDocument(targetDocument, { preview: true });
+      const line = Math.min(Math.max(location.line - 1, 0), Math.max(targetDocument.lineCount - 1, 0));
+      const rawColumn = Number.isInteger(location.column) && location.column > 0 ? location.column - 1 : 0;
+      const column = Math.min(Math.max(rawColumn, 0), targetDocument.lineAt(line).text.length);
+      const position = new vscode.Position(line, column);
+      const end = this.locationEndPosition(targetDocument, location, position);
+      editor.selection = new vscode.Selection(position, end);
+      editor.revealRange(new vscode.Range(position, end), vscode.TextEditorRevealType.InCenter);
+    } catch (error) {
+      const label = location.file || path.basename(document.uri.fsPath);
+      vscode.window.showWarningMessage(`Unable to open MLIR location ${label}:${location.line}: ${error.message}`);
+    }
+  }
+
+  locationUri(document, file) {
+    if (typeof file !== 'string' || file.length === 0) {
+      return document.uri;
+    }
+    if (path.isAbsolute(file)) {
+      return vscode.Uri.file(file);
+    }
+    return vscode.Uri.file(path.join(path.dirname(document.uri.fsPath), file));
+  }
+
+  locationEndPosition(document, location, start) {
+    const hasEndLine = Number.isInteger(location.end_line) && location.end_line > 0;
+    const hasEndColumn = Number.isInteger(location.end_column) && location.end_column > 0;
+    if (!hasEndLine && !hasEndColumn) {
+      return start;
+    }
+    const line = hasEndLine
+      ? Math.min(Math.max(location.end_line - 1, 0), Math.max(document.lineCount - 1, 0))
+      : start.line;
+    const rawColumn = hasEndColumn ? location.end_column - 1 : 0;
+    const column = Math.min(Math.max(rawColumn, 0), document.lineAt(line).text.length);
+    const end = new vscode.Position(line, column);
+    return end.isBefore(start) ? start : end;
   }
 
   html(webview, mediaRoot) {
